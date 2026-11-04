@@ -17,19 +17,19 @@ public:
     NumberExprAST(double val);
 };
 
-class VariableExprAst : public ExprAST {
+class VariableExprAST : public ExprAST {
     std::string m_name;
 
 public:
-    VariableExprAst(const std::string &name);
+    VariableExprAST(const std::string &name);
 };
 
-class BinaryExprAst : public ExprAST {
+class BinaryExprAST : public ExprAST {
     char m_op;
     std::unique_ptr<ExprAST> m_LHS, m_RHS;
 
 public:
-    BinaryExprAst(char op, std::unique_ptr<ExprAST> LHS,
+    BinaryExprAST(char op, std::unique_ptr<ExprAST> LHS,
                   std::unique_ptr<ExprAST> RHS);
 };
 
