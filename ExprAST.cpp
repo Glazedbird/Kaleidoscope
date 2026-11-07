@@ -4,9 +4,9 @@
 
 NumberExprAST::NumberExprAST(double val) : m_val(val) {}
 
-VariableExprAst::VariableExprAst(const std::string &name) : m_name(name) {}
+VariableExprAST::VariableExprAST(const std::string &name) : m_name(name) {}
 
-BinaryExprAst::BinaryExprAst(char op, std::unique_ptr<ExprAST> LHS,
+BinaryExprAST::BinaryExprAST(char op, std::unique_ptr<ExprAST> LHS,
                            std::unique_ptr<ExprAST> RHS)
     : m_op(op), m_LHS(std::move(LHS)), m_RHS(std::move(RHS)) {}
 

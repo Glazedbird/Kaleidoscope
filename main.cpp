@@ -1,9 +1,14 @@
+#include "Parser.h"
 #include "token.h"
 
 #include <cstdio>
+#include <string>
+#include <unistd.h>
 
-// 测试入口：从标准输入读取代码，并打印每次 gettok() 的结果。
-int main() {
+namespace {
+
+// 保留原有的词法分析调试入口。
+int PrintTokens() {
     while (true) {
         int Tok = gettok();
         switch (Tok) {
@@ -27,4 +32,69 @@ int main() {
             break;
         }
     }
+}
+
+// 丢弃当前出错语句，停在分号、下一条声明或 EOF，保证解析继续推进。
+void RecoverFromError() {
+    while (CurTok != tok_eof && CurTok != ';' &&
+           CurTok != tok_def && CurTok != tok_extern)
+        getNextToken();
+}
+
+int MainLoop() {
+    const bool Interactive = isatty(fileno(stdin));
+    bool HadError = false;
+    if (Interactive)
+        std::fprintf(stderr, "ready> ");
+    getNextToken();
+
+    while (CurTok != tok_eof) {
+        bool Parsed = false;
+        switch (CurTok) {
+        case ';': // 顶层分号用于分隔语句，本身不产生 AST。
+            Parsed = true;
+            break;
+        case tok_def:
+            if (auto Function = ParseDefinition()) {
+                std::printf("Parsed a function definition: %s\n",
+                            Function->getPrototype().getName().c_str());
+                Parsed = true;
+            }
+            break;
+        case tok_extern:
+            if (auto Proto = ParseExtern()) {
+                std::printf("Parsed an extern: %s\n", Proto->getName().c_str());
+                Parsed = true;
+            }
+            break;
+        default:
+            if (auto Function = ParseTopLevelExpr()) {
+                std::printf("Parsed a top-level expression\n");
+                Parsed = true;
+            }
+            break;
+        }
+
+        if (!Parsed) {
+            HadError = true;
+            RecoverFromError();
+        }
+        if (Interactive)
+            std::fprintf(stderr, "ready> ");
+        if (CurTok == ';')
+            getNextToken();
+    }
+    return HadError ? 1 : 0;
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+    if (argc == 2 && std::string(argv[1]) == "--tokens")
+        return PrintTokens();
+    if (argc != 1) {
+        std::fprintf(stderr, "Usage: %s [--tokens]\n", argv[0]);
+        return 1;
+    }
+    return MainLoop();
 }
