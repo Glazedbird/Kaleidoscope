@@ -2,6 +2,7 @@
 #define KALEIDOSCOPE_PARSER_H
 
 #include "ExprAST.h"
+#include "token.h"
 #include <map>
 
 // 当前等待解析的 token，调用 getNextToken() 后更新。
@@ -100,6 +101,7 @@ static int GetTokPrecedence() {
     return TokPrec;
 }
 
+// 从这里看 所谓的 二元运算表达式应该是和基础表达式是有关系的
 static std::unique_ptr<ExprAST> ParseExpression() {
     auto LHS = ParsePrimary();
     if(!LHS)
@@ -109,6 +111,8 @@ static std::unique_ptr<ExprAST> ParseExpression() {
 
 /// binoprhs
 /// ::= ('+' primary)*
+/// 这里大概是因为 所谓的 二叉查找树的算法，但是其实每台看懂是怎么执行的
+/// 关键点在于 基础表达式和它的关系
 static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
                                               std::unique_ptr<ExprAST> LHS){
     while(true) {
@@ -118,19 +122,100 @@ static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
         if(TokPrec < ExprPrec)
             return LHS;
         
-        int BIinOp = CurTok;
+        int BinOp = CurTok;
         getNextToken();
 
         auto RHS = ParsePrimary();
         if(!RHS)
             return nullptr;
 
+        int NextPrec = GetTokPrecedence();
+        if (TokPrec < NextPrec) {
+            RHS = ParseBinOpRHS(TokPrec + 1, std::move(RHS));
+            if(!RHS)
+                return nullptr;
+        }
 
+        LHS = std::make_unique<BinaryExprAST>(BinOp, std::move(LHS),
+                                              std::move(RHS));
 
     }
 
 }
 
+/// handling 函数原型
+
+/// prototype
+///   ::=id'('id*')'
+
+static std::unique_ptr<PrototypeAST> ParsePrototype() {
+    if (CurTok != tok_identifier)
+        return LogErrorP("Expected function name in prototype");
+    
+    std::string FnName = IdentifierStr;
+    // 需要依赖下一个字符的信息
+    getNextToken();
+
+    if(CurTok != '(')
+        return LogErrorP("Expected '(' in prototype");
+    
+    std::vector<std::string> ArgNames;
+    while (getNextToken() == tok_identifier)
+        ArgNames.push_back(IdentifierStr);
+    
+    if (CurTok != ')')
+        return LogErrorP("Expected ')' in prototype");
+    
+    getNextToken();
+    return std::make_unique<PrototypeAST>(FnName, std::move(ArgNames));
+}
+
+static std::unique_ptr<FunctionAST> ParseDefinition() {
+    // 这里其实可以看出 默认 Token 其实就是指向上一个 Token
+    getNextToken();
+    auto Proto = ParsePrototype();
+    if(!Proto) return nullptr;
+
+    if(auto E = ParseExpression())
+        return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
+    
+    return nullptr;
+}
+
+/// toplevelexpr ::= expression
+//  这个函数是 用来干嘛的 ？
+//  什么是 top-level semicolons ?
+static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
+  if (auto E = ParseExpression()) {
+    // Make an anonymous proto.
+    auto Proto = std::make_unique<PrototypeAST>("__anon_expr", std::vector<std::string>());
+    return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
+  }
+  return nullptr;
+}
+
+static void MainLoop() {
+    while (true)
+    {
+        fprintf(stderr, "ready> ");
+        switch (CurTok)
+        {
+        case tok_eof:
+            return;
+        case ';':
+            getNextToken();
+            break;
+        case tok_def:
+            /// Unfinished
+
+        default:
+            break;
+        }
+    }
+    
+}
+
+// how to generate LLVM Intermediate Representation from AST?
 int main() {
     BinopPrecedence['<'] = 10;
     BinopPrecedence['+'] = 20;
