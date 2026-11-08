@@ -22,6 +22,9 @@ std::string Describe(const ExprAST &Expr) {
     }
     if (auto Variable = dynamic_cast<const VariableExprAST *>(&Expr))
         return Variable->getName();
+    if (auto Unary = dynamic_cast<const UnaryAST *>(&Expr))
+        return std::string("(unary ") + Unary->getOp() + " " +
+               Describe(Unary->getExpr()) + ")";
     if (auto Binary = dynamic_cast<const BinaryExprAST *>(&Expr))
         return std::string("(") + Binary->getOp() + " " +
                Describe(Binary->getLHS()) + " " + Describe(Binary->getRHS()) + ")";
@@ -48,6 +51,11 @@ int main() {
             "(+ 1 (* 2 3))", "(* (+ 1 2) 3)", "(- (- 10 3) 2)",
             "(< (+ 1 2) (* 3 4))", "(call foo 1 (call bar (+ 2 3)) x)",
             "(call empty)", "x", "12.5",
+            "(unary - 2)", "(+ 1 (unary - 2))", "(* 1 (unary - 2))",
+            "(* (unary - (+ 1 2)) 3)", "(unary - (unary - 2))",
+            "(- 1 (unary - 2))", "(unary - (call foo 1 2))",
+            "(call foo (unary - 1) (unary - (unary - 2)))",
+            "(* (unary - x) y)", "(< x (unary - y))",
         };
         for (const char *Tree : Expected) {
             auto Function = ParseTopLevelExpr();
@@ -82,8 +90,17 @@ int main() {
               Proto->getArgs() == std::vector<std::string>({"a", "b"}),
               "wrong multi-argument prototype");
         NextStatement();
+
+        Check(CurTok == tok_def, "expected unary function definition");
+        auto Negation = ParseDefinition();
+        Check(Negation && Negation->getPrototype().getName() == "neg" &&
+              Negation->getPrototype().getArgs() == std::vector<std::string>({"x"}),
+              "wrong unary function prototype");
+        Check(Describe(Negation->getBody()) == "(unary - x)",
+              "wrong unary function body");
+        NextStatement();
         Check(CurTok == tok_eof, "expected end of input");
-        std::puts("Parser AST tests passed (11 statements).");
+        std::puts("Parser AST tests passed (22 statements).");
     } catch (const std::exception &Error) {
         std::fprintf(stderr, "Test failed: %s\n", Error.what());
         return 1;

@@ -10,6 +10,23 @@ public:
     virtual ~ExprAST() = default;
 };
 
+// 遇到的第一个问题，这里 UnaryAST 到底应该怎么定义？
+// 他是 primary expression 吗
+// 或者它应该是和 binop 是同一个层级的，所以可以仿照 bin写
+// 这里其实还有一个问题，就是使用指针比如unique_ptr 和直接传递 变量有什么区别？
+    // 运行时多态
+class UnaryAST : public ExprAST {
+private:
+    char m_op;
+    std::unique_ptr<ExprAST> m_expr;
+public:
+    UnaryAST(char op,
+             std::unique_ptr<ExprAST> expr);
+    char getOp() const {return m_op;}
+    // 末尾的 const： 声明这个方法通过当前对象进行只读操作
+    const ExprAST &getExpr() const {return *m_expr;}
+};
+
 class NumberExprAST : public ExprAST {
     double m_val;
 

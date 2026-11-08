@@ -8,6 +8,19 @@ empty();
 x;
 12.5;
 
+# 一元负号优先级、递归、二元减法、函数调用和变量。
+-2;
+1 + -2;
+1 * -2;
+-(1 + 2) * 3;
+--2;
+1--2;
+-foo(1, 2);
+foo(-1, --2);
+-x * y;
+x < -y;
+
 def combine(x y) x + y * 2;
 extern clock();
 extern foo(a b);
+def neg(x) -x;

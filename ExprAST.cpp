@@ -22,3 +22,7 @@ const std::string &PrototypeAST::getName() const { return m_name; }
 FunctionAST::FunctionAST(std::unique_ptr<PrototypeAST> proto,
                        std::unique_ptr<ExprAST> body)
     : m_proto(std::move(proto)), m_body(std::move(body)) {}
+
+UnaryAST::UnaryAST(char op,
+                   std::unique_ptr<ExprAST> expr)
+    : m_op(op), m_expr(std::move(expr)) {}

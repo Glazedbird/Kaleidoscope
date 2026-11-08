@@ -42,6 +42,12 @@ class CliTests(unittest.TestCase):
             ("extern foo x", "expected '(' in prototype"),
             ("extern foo(x, y)", "expected ')' in prototype"),
             ("@", "unknown token when expecting an expression"),
+            ("-", "unknown token when expecting an expression"),
+            ("--", "unknown token when expecting an expression"),
+            ("1 * -", "unknown token when expecting an expression"),
+            ("foo(-)", "unknown token when expecting an expression"),
+            ("-(1 + )", "unknown token when expecting an expression"),
+            ("def neg(x) -", "unknown token when expecting an expression"),
         ]
         for source, diagnostic in cases:
             with self.subTest(source=source):
@@ -54,7 +60,8 @@ class CliTests(unittest.TestCase):
                 ])
 
     def test_eof_during_parsing(self):
-        for source in ("def", "extern", "foo(", "(1", "1 +", "def foo()"):
+        for source in ("def", "extern", "foo(", "(1", "1 +", "def foo()",
+                       "-", "--", "1 * -", "-(", "foo(-"):
             with self.subTest(source=source):
                 result = run(source)
                 self.assertEqual(result.returncode, 1)
@@ -65,11 +72,12 @@ class CliTests(unittest.TestCase):
             ("def recovered() 1", "Parsed a function definition: recovered\n"),
             ("extern recovered()", "Parsed an extern: recovered\n"),
         ):
-            with self.subTest(statement=statement):
-                result = run("@ " + statement)
-                self.assertEqual(result.returncode, 1)
-                self.assertIn("Error:", result.stderr)
-                self.assertEqual(result.stdout, output)
+            for prefix in ("@ ", "- ", "-- ", "1 * - "):
+                with self.subTest(statement=statement, prefix=prefix):
+                    result = run(prefix + statement)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("Error:", result.stderr)
+                    self.assertEqual(result.stdout, output)
 
     def test_tokens_mode(self):
         result = run("def foo(x) x + 1; # comment", "--tokens")
@@ -121,13 +129,45 @@ Function
                                  "  Prototype __anon_expr()\n" + tree)
 
     def test_dump_ast_error_recovery(self):
-        result = run("1 + ; 2;", "--dump-ast")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("Error:", result.stderr)
-        self.assertEqual(result.stdout, """Parsed a top-level expression
+        for source in ("1 + ; 2;", "-; 2;", "1 * -; 2;", "foo(-); 2;", "--; 2;"):
+            with self.subTest(source=source):
+                result = run(source, "--dump-ast")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("Error:", result.stderr)
+                self.assertEqual(result.stdout, """Parsed a top-level expression
 Function
   Prototype __anon_expr()
   Number 2
+""")
+
+    def test_dump_ast_unary(self):
+        cases = (
+            ("-2;", "  Unary '-'\n    Number 2\n"),
+            ("--2;", "  Unary '-'\n    Unary '-'\n      Number 2\n"),
+            ("1 * -2;", "  Binary '*'\n    Number 1\n    Unary '-'\n      Number 2\n"),
+            ("-(1 + 2) * 3;", "  Binary '*'\n    Unary '-'\n      Binary '+'\n"
+             "        Number 1\n        Number 2\n    Number 3\n"),
+            ("foo(-1, --2);", "  Call foo\n    Unary '-'\n      Number 1\n"
+             "    Unary '-'\n      Unary '-'\n        Number 2\n"),
+        )
+        for source, tree in cases:
+            with self.subTest(source=source):
+                result = run(source, "--dump-ast")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(result.stdout,
+                                 "Parsed a top-level expression\nFunction\n"
+                                 "  Prototype __anon_expr()\n" + tree)
+
+    def test_dump_ast_unary_definition(self):
+        result = run("def neg(x) -x;", "--dump-ast")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout, """Parsed a function definition: neg
+Function
+  Prototype neg(x)
+  Unary '-'
+    Variable x
 """)
 
     def test_dump_ast_empty_input(self):

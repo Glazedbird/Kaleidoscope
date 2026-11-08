@@ -108,7 +108,7 @@ std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
 
         char BinOp = static_cast<char>(CurTok);
         getNextToken(); // 消费运算符。
-        auto RHS = ParsePrimary();
+        auto RHS = ParseUnaryOp();
         if (!RHS)
             return nullptr;
 
@@ -145,9 +145,9 @@ std::unique_ptr<PrototypeAST> ParsePrototype() {
 
 } // namespace
 
-// expression ::= primary binoprhs
+// expression ::= unary binoprhs
 std::unique_ptr<ExprAST> ParseExpression() {
-    auto LHS = ParsePrimary();
+    auto LHS = ParseUnaryOp();
     if (!LHS)
         return nullptr;
     return ParseBinOpRHS(0, std::move(LHS));
@@ -180,4 +180,25 @@ std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
         return std::make_unique<FunctionAST>(std::move(Proto), std::move(Body));
     }
     return nullptr;
+}
+
+// 新增一个提取 一元表达式的 Parser
+
+// unary ::= '-' unary | primary
+// 遇到非负号 token 时交给 ParsePrimary()，解析数字、变量、调用或括号。
+std::unique_ptr<ExprAST> ParseUnaryOp() {
+
+    if (CurTok != '-') {
+        return ParsePrimary();
+    }
+
+    char op = static_cast<char>(CurTok);
+    getNextToken();
+
+    auto Operand = ParseUnaryOp();
+    // 操作数解析失败时向上传播，不构造缺少子树的一元节点。
+    if (!Operand)
+        return nullptr;
+    // 这个地方应该是 move 的转移所有权
+    return std::make_unique<UnaryAST>(op, std::move(Operand));
 }

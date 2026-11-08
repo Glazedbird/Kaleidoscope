@@ -10,6 +10,9 @@ void DumpAST(const ExprAST &Expr, std::ostream &Out, int Indent) {
         Out << "Number " << Number->getValue() << '\n';
     } else if (auto Variable = dynamic_cast<const VariableExprAST *>(&Expr)) {
         Out << "Variable " << Variable->getName() << '\n';
+    } else if (auto Unary = dynamic_cast<const UnaryAST *>(&Expr)) {
+        Out << "Unary '" << Unary->getOp() << "'\n";
+        DumpAST(Unary->getExpr(), Out, Indent + 2);
     } else if (auto Binary = dynamic_cast<const BinaryExprAST *>(&Expr)) {
         Out << "Binary '" << Binary->getOp() << "'\n";
         DumpAST(Binary->getLHS(), Out, Indent + 2);
