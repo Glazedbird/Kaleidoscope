@@ -1,0 +1,9 @@
+第 1 页讲稿（约 45–60 秒）
+这阶段我主要在学习和实现 Kaleidoscope 的编译前端，阶段目标是把源码转换为抽象语法树，为后续代码生成提供结构化输入。整个流程分为词法分析、语法分析和 AST 表示。目前词法分析可以识别关键字、变量名、数字和符号，也能跳过注释；本次单独编译 main.cpp 与 token.cpp，已运行示例验证 token 输出。AST 已定义数字、变量、二元运算，以及函数调用、函数原型和函数定义等节点。代码也已按模块拆开，当前重点转向 Parser。
+
+证据与边界：token.cpp / token.h；ExprAST.h / ExprAST.cpp；main.cpp；独立词法测试通过。当前完整项目构建未通过：ExprAST.h 与 ExprAST.cpp 的 VariableExprAST、BinaryExprAST 类名大小写尚未同步；Parser 也还在编写中。因此这里的 AST 进展指节点类型已定义，不能表述为已完成 AST 自动生成。
+
+第 2 页讲稿（约 50–70 秒）
+Parser 的作用是根据语法规则，把 token 组织成 AST。现在已经写出数字、标识符、函数调用和括号表达式的解析草稿。我正在推进二元运算部分，难点是同时处理运算符优先级、递归解析和节点所有权。右边是下一步希望验证的例子：a 加 b 乘 2，乘法应该先结合，所以乘法节点应位于加法的右子树。下一步先统一接口并解决编译问题，再补齐优先级解析中右侧递归和二元节点构造，最后用变量、调用、括号和优先级样例验证。表达式流程打通后，再继续做函数声明和函数定义的解析。
+
+证据与边界：Parser.h 已写 ParseNumberExpr、ParseParenExpr、ParseIdentifierExpr、ParsePrimary、GetTokPrecedence、ParseExpression 与未完成的 ParseBinOpRHS。当前仍有 token 声明可见性、解析函数前置声明、头文件中的 main 入口，以及类名同步等联调问题。ParseBinOpRHS 尚未完成右侧优先级递归和 BinaryExprAST 构造。右图是预期验收结构，不是当前程序运行结果。

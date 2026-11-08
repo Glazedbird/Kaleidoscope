@@ -1,0 +1,829 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LLVM Kaleidoscope 第三章：生成 LLVM IR（中文翻译）</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;line-height:1.85;color:#242a35;background:#fff;max-width:920px;margin:0 auto;padding:42px 25px}h1{font-size:2rem;line-height:1.4;margin-bottom:8px}h2{font-size:1.5rem;border-bottom:1px solid #dae0e6;padding:24px 0 10px;margin-top:38px}p{margin:17px 0;font-size:16px}pre{background:#f4f6f9;border:1px solid #e1e6eb;border-radius:0 0 9px 9px;padding:17px;overflow:auto;line-height:1.5;font-size:13px;tab-size:2;margin-top:0}code{font-family:Consolas,"DejaVu Sans Mono",monospace}.code-title{background:#e9edf3;border-radius:9px 9px 0 0;padding:4px 14px;font-size:12px;color:#526174;margin-top:20px}nav{display:flex;flex-wrap:wrap;gap:10px;margin:24px 0;padding:18px;background:#f5f7fa;border-radius:10px}nav a{color:#1656a5;text-decoration:none;font-size:14px}blockquote{border-left:3px solid #888;padding-left:15px}.note{color:#546170;font-size:14px}a{color:#1656a5}@media print{body{padding:0}pre{white-space:pre-wrap;word-wrap:break-word}section{break-inside:auto}}</style></head><body><h1>第三章：Kaleidoscope——生成 LLVM IR</h1><p class="note">根据所上传 LLVM 官方教程第三章 HTML 翻译；3.1–3.6 的正文已翻译，C++ 源码及 LLVM IR 示例保留英文和原始语法，以便编译实验和对照阅读。原文：<a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl03.html">LLVM Chapter 3</a></p><nav><a href="#s3.1">3.1 第三章简介</a><a href="#s3.2">3.2 代码生成的准备工作</a><a href="#s3.3">3.3 表达式的代码生成</a><a href="#s3.4">3.4 函数的代码生成</a><a href="#s3.5">3.5 驱动程序的修改与总结</a><a href="#s3.6">3.6 完整代码清单</a></nav><section id="s3.1"><h2>3.1 第三章简介</h2><p>欢迎来到《使用 LLVM 实现一门语言》教程的第三章。本章展示如何将第二章构建的抽象语法树（AST）转换为 LLVM IR。通过这个过程，你将初步了解 LLVM 的工作方式，也会看到它实际上很容易使用。相比生成 LLVM IR，编写词法分析器和语法分析器要费事得多。:)</p><p>请注意：本章及后续章节的代码要求 LLVM 3.7 或更新版本，LLVM 3.6 及更早版本无法使用。同时，你应使用与自己安装的 LLVM 发行版本相匹配的教程版本。如果使用 LLVM 官方发行版，请查看该版本附带的文档，或 llvm.org 的发行版本页面。</p></section><section id="s3.2"><h2>3.2 代码生成的准备工作</h2><p>为了生成 LLVM IR，我们先做一些简单的准备工作。首先，在各个 AST 类中定义虚拟的代码生成（codegen）方法：</p><div class="code-title">C++ · 原代码保留</div><pre><code>/// ExprAST - Base class for all expression nodes.
+class ExprAST {
+public:
+  virtual ~ExprAST() = default;
+  virtual Value *codegen() = 0;
+};
+
+/// NumberExprAST - Expression class for numeric literals like &quot;1.0&quot;.
+class NumberExprAST : public ExprAST {
+  double Val;
+
+public:
+  NumberExprAST(double Val) : Val(Val) {}
+  Value *codegen() override;
+};
+...
+</code></pre><p>codegen() 方法负责为当前 AST 节点及其依赖的所有内容生成 IR，且统一返回一个 LLVM Value 对象。在 LLVM 中，Value 类用于表示“静态单赋值（SSA）寄存器”或“SSA 值”。SSA 值最显著的特征在于：其值是在对应指令执行时计算得到的；除非该指令再次执行，否则不会得到新值。换句话说，你不能直接“修改”一个 SSA 值。有关更多信息，请阅读静态单赋值形式的资料；理解其概念后就会发现它十分自然。</p><p>需要注意，我们也可以不在 ExprAST 类层次结构中加入虚函数，而是采用访问者模式（Visitor Pattern）或其他设计方式。这个教程仍然不会深入讨论软件工程中的最佳实践：对我们的目的而言，添加虚函数是最简单的方案。</p><p>其次，需要一个与语法分析器中类似的 LogError 方法，用来报告代码生成过程中发现的错误，例如引用未声明的参数：</p><div class="code-title">C++ · 原代码保留</div><pre><code>static std::unique_ptr&lt;LLVMContext&gt; TheContext;
+static std::unique_ptr&lt;IRBuilder&lt;&gt;&gt; Builder;
+static std::unique_ptr&lt;Module&gt; TheModule;
+static std::map&lt;std::string, Value *&gt; NamedValues;
+
+Value *LogErrorV(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+</code></pre><p>这些静态变量将在代码生成过程中使用。TheContext 是一个不透明的对象，持有许多 LLVM 核心数据结构，例如类型表和常量值表。我们不需要深入理解它，只需要创建一个实例，并在相关 API 要求时传入即可。</p><p>Builder 是一个帮助生成 LLVM 指令的辅助对象。IRBuilder 类模板的实例会记录当前指令插入位置，并提供创建新指令的方法。</p><p>TheModule 是 LLVM 的一种结构，用于包含函数和全局变量。它在许多方面都是 LLVM IR 用来容纳代码的顶层结构。它也拥有我们生成的全部 IR 对象的内存，因此 codegen() 返回原始的 Value* 指针，而不是 unique_ptr&lt;Value&gt;。</p><p>NamedValues 映射记录当前作用域内定义了哪些值，以及它们对应的 LLVM 表示。换言之，它就是代码生成所使用的符号表。在当前版本的 Kaleidoscope 中，唯一能够通过名称引用的是函数参数。因此，生成函数体代码时，函数参数会出现在这个映射中。</p><p>完成这些准备后，就可以讨论如何为每种表达式生成代码。请注意，下面假定 Builder 已经配置好一个可以向其中生成代码的目标位置。我们暂且认为这一步已经完成，直接用它来生成 IR。</p></section><section id="s3.3"><h2>3.3 表达式的代码生成</h2><p>为表达式节点生成 LLVM 代码十分直接：我们现有的四类表达式节点，总共只需要不到 45 行带注释的代码。先从数字字面量开始：</p><div class="code-title">C++ · 原代码保留</div><pre><code>Value *NumberExprAST::codegen() {
+  return ConstantFP::get(*TheContext, APFloat(Val));
+}
+</code></pre><p>在 LLVM IR 中，数字常量由 ConstantFP 类表示，它内部用 APFloat 保存数值（APFloat 能表示任意精度的浮点常量）。这段代码基本上就是创建并返回一个 ConstantFP。注意，LLVM IR 中的常量会被唯一化并共享。因此，此处 API 采用“foo::get(…)”这种惯用形式，而非“new foo(..)”或“foo::Create(..)”。</p><div class="code-title">C++ · 原代码保留</div><pre><code>Value *VariableExprAST::codegen() {
+  // Look this variable up in the function.
+  Value *V = NamedValues[Name];
+  if (!V)
+    LogErrorV(&quot;Unknown variable name&quot;);
+  return V;
+}
+</code></pre><p>使用 LLVM 处理变量引用也相当简单。在这个简化版 Kaleidoscope 中，我们假定变量已经在某处生成，其值可以直接使用。实际上，NamedValues 映射目前只可能包含函数参数。代码只检查指定名称是否存在于映射中（若不存在，就表示引用了未知变量），然后返回相应的值。在后续章节，我们将把循环归纳变量及局部变量也加入符号表。</p><div class="code-title">C++ · 原代码保留</div><pre><code>Value *BinaryExprAST::codegen() {
+  Value *L = LHS-&gt;codegen();
+  Value *R = RHS-&gt;codegen();
+  if (!L || !R)
+    return nullptr;
+
+  switch (Op) {
+  case &#x27;+&#x27;:
+    return Builder-&gt;CreateFAdd(L, R, &quot;addtmp&quot;);
+  case &#x27;-&#x27;:
+    return Builder-&gt;CreateFSub(L, R, &quot;subtmp&quot;);
+  case &#x27;*&#x27;:
+    return Builder-&gt;CreateFMul(L, R, &quot;multmp&quot;);
+  case &#x27;&lt;&#x27;:
+    L = Builder-&gt;CreateFCmpULT(L, R, &quot;cmptmp&quot;);
+    // Convert bool 0/1 to double 0.0 or 1.0
+    return Builder-&gt;CreateUIToFP(L, Type::getDoubleTy(*TheContext),
+                                 &quot;booltmp&quot;);
+  default:
+    return LogErrorV(&quot;invalid binary operator&quot;);
+  }
+}
+</code></pre><p>二元运算符稍微有趣一些。基本思想是：先递归地为表达式左操作数生成代码，再为右操作数生成代码，最后计算整个二元表达式的结果。这里通过一个简单的 switch，根据运算符创建相应的 LLVM 指令。</p><p>上面的例子开始体现 LLVM 构造器类的价值。IRBuilder 知道新建指令应插入哪里，因此你只需指定要创建的指令（例如 CreateFAdd）、使用哪些操作数（这里是 L 和 R），以及可选的指令名称。</p><p>LLVM 的一个便利之处在于：名称只是一种提示。例如，上述代码若生成多个名为“addtmp”的变量，LLVM 会自动为它们添加递增的、唯一的数字后缀。指令的局部结果名称完全可以省略，但起名能让打印出来的 IR 更容易阅读。</p><p>LLVM 指令受到严格规则约束。例如，add 指令的左、右操作数必须具有相同类型，结果类型也必须与操作数类型一致。由于 Kaleidoscope 中的所有值都是 double 类型，生成加、减、乘指令的代码就非常简单。</p><p>另一方面，LLVM 规定 fcmp 指令始终返回一个 i1 值（1 位整数）。问题在于，Kaleidoscope 希望比较结果是 0.0 或 1.0。为实现这一语义，我们将 fcmp 与 uitofp 指令结合使用。uitofp 把输入整数视为无符号值并转换为浮点值。相比之下，如果使用 sitofp，Kaleidoscope 的 &lt; 运算符将根据输入返回 0.0 或 -1.0。</p><div class="code-title">C++ · 原代码保留</div><pre><code>Value *CallExprAST::codegen() {
+  // Look up the name in the global module table.
+  Function *CalleeF = TheModule-&gt;getFunction(Callee);
+  if (!CalleeF)
+    return LogErrorV(&quot;Unknown function referenced&quot;);
+
+  // If argument mismatch error.
+  if (CalleeF-&gt;arg_size() != Args.size())
+    return LogErrorV(&quot;Incorrect # arguments passed&quot;);
+
+  std::vector&lt;Value *&gt; ArgsV;
+  for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+    ArgsV.push_back(Args[i]-&gt;codegen());
+    if (!ArgsV.back())
+      return nullptr;
+  }
+
+  return Builder-&gt;CreateCall(CalleeF, ArgsV, &quot;calltmp&quot;);
+}
+</code></pre><p>借助 LLVM，为函数调用生成代码也十分直接。上述代码先在 LLVM Module 的符号表中查找函数名称。回想一下，LLVM Module 是保存准备交给 JIT 的函数的容器。只要为函数赋予与用户指定名称相同的名字，我们就能利用 LLVM 的符号表完成函数名解析。</p><p>找到被调用函数后，我们递归地为传入的每一个实参生成代码，再创建一条 LLVM call 指令。请注意，LLVM 默认使用原生 C 调用约定，因此无需额外工作，这些调用也能够调用“sin”“cos”等标准库函数。</p><p>至此，我们已经完成 Kaleidoscope 当前四种基础表达式的处理。你可以自行尝试添加更多类型。例如，浏览 LLVM 语言参考手册，可以找到其他一些有趣的指令，它们很容易被接入我们现有的基本框架。</p></section><section id="s3.4"><h2>3.4 函数的代码生成</h2><p>函数原型和函数的代码生成需要处理不少细节，因此不如表达式的代码生成那样简洁，但可以借此说明若干重要概念。先讨论函数原型的代码生成：函数定义和外部函数声明都会用到原型。代码开头如下：</p><div class="code-title">C++ · 原代码保留</div><pre><code>Function *PrototypeAST::codegen() {
+  // Make the function type:  double(double,double) etc.
+  std::vector&lt;Type*&gt; Doubles(Args.size(),
+                             Type::getDoubleTy(*TheContext));
+  FunctionType *FT =
+    FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false);
+
+  Function *F =
+    Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
+</code></pre><p>短短几行代码蕴含了不少功能。首先注意，该函数返回 Function*，而不是 Value*。这是因为“函数原型”描述的是函数的外部接口，而不是表达式计算出的值；因此，生成代码时返回其对应的 LLVM Function 是合理的。</p><p>FunctionType::get 调用为指定的原型创建 FunctionType。由于 Kaleidoscope 中所有函数参数都是 double 类型，第一行先创建一个包含 N 个 LLVM double 类型的向量。随后使用 FunctionType::get 创建函数类型：接收 N 个 double 参数，返回一个 double 结果，并且不是可变参数函数（false 参数表示这一点）。注意，LLVM 中的类型和常量一样也会被唯一化，因此不是通过 new 创建类型，而是通过 get 获取类型。</p><p>上述最后一行真正创建了与原型对应的 IR Function。它指定函数类型、链接属性、名称，以及要插入的模块。“外部链接”（external linkage）意味着函数可以定义在当前模块之外，和／或可由模块外的函数调用。传入的 Name 是用户指定的名称；因为指定了 TheModule，所以该名称也会注册到 TheModule 的符号表中。</p><div class="code-title">C++ · 原代码保留</div><pre><code>// Set names for all arguments.
+unsigned Idx = 0;
+for (auto &amp;Arg : F-&gt;args())
+  Arg.setName(Args[Idx++]);
+
+return F;
+</code></pre><p>最后，我们根据原型中的参数名称，为函数的每个参数命名。这一步并非严格必需，但名称一致能使 IR 更易读，也使后续代码能够直接根据名称引用参数，而无须再次到 Prototype AST 中查找。</p><p>到这里，我们得到了一个没有函数体的函数原型。这正是 LLVM IR 表示函数声明的方式。对于 Kaleidoscope 的 extern 语句，到此就足够了；但是对于函数定义，我们还需要生成函数体代码，并将其附加到函数上。</p><div class="code-title">C++ · 原代码保留</div><pre><code>Function *FunctionAST::codegen() {
+    // First, check for an existing function from a previous &#x27;extern&#x27; declaration.
+  Function *TheFunction = TheModule-&gt;getFunction(Proto-&gt;getName());
+
+  if (!TheFunction)
+    TheFunction = Proto-&gt;codegen();
+
+  if (!TheFunction)
+    return nullptr;
+
+  if (!TheFunction-&gt;empty())
+    return (Function*)LogErrorV(&quot;Function cannot be redefined.&quot;);
+</code></pre><p>生成函数定义时，首先在 TheModule 的符号表中查找该函数是否已存在，因为用户可能此前通过 extern 创建了它。如果 Module::getFunction 返回空指针，就表示此前没有该函数，需要根据 Prototype 生成一个。无论哪种情况，正式开始之前，都要确认函数目前还是空的（即没有函数体）。</p><div class="code-title">C++ · 原代码保留</div><pre><code>// Create a new basic block to start insertion into.
+BasicBlock *BB = BasicBlock::Create(*TheContext, &quot;entry&quot;, TheFunction);
+Builder-&gt;SetInsertPoint(BB);
+
+// Record the function arguments in the NamedValues map.
+NamedValues.clear();
+for (auto &amp;Arg : TheFunction-&gt;args())
+  NamedValues[std::string(Arg.getName())] = &amp;Arg;
+</code></pre><p>现在开始配置 Builder。第一行创建一个名为“entry”的新基本块，并将其插入 TheFunction。第二行告诉 Builder，后续创建的指令应插入该基本块末尾。在 LLVM 中，基本块是函数的重要组成部分，也是控制流图（CFG）的构成单元。由于目前还没有控制流语句，我们的每个函数此时只包含一个基本块。第五章会改变这一点。:)</p><p>接下来先清空 NamedValues 映射，再将函数参数加入其中，使 VariableExprAST 节点可以访问它们。</p><div class="code-title">C++ · 原代码保留</div><pre><code>if (Value *RetVal = Body-&gt;codegen()) {
+  // Finish off the function.
+  Builder-&gt;CreateRet(RetVal);
+
+  // Validate the generated code, checking for consistency.
+  verifyFunction(*TheFunction);
+
+  return TheFunction;
+}
+</code></pre><p>设置好插入点并填充 NamedValues 后，调用函数根表达式的 codegen() 方法。若没有错误，它会向 entry 基本块中生成计算表达式的代码，并返回计算结果对应的值。随后我们创建一条 LLVM ret 指令，完成函数体。函数构建完毕后，调用 LLVM 提供的 verifyFunction，对生成的代码进行多种一致性检查，以确认编译器是否正确工作。使用验证器非常重要，因为它能捕获很多错误。函数完成并验证后，我们就返回它。</p><div class="code-title">C++ · 原代码保留</div><pre><code>  // Error reading body, remove function.
+  TheFunction-&gt;eraseFromParent();
+  return nullptr;
+}
+</code></pre><p>最后还需要处理错误情况。为了简单，我们仅使用 eraseFromParent 方法删除刚才生成的函数。这样用户就能重新定义之前输入错误的函数：如果不删除，错误函数就会带着函数体留在符号表中，阻止后续重新定义。</p><p>不过，这段代码确实有一个 bug：如果 FunctionAST::codegen() 找到了已有的 IR Function，它不会验证该函数签名是否与当前函数定义的原型一致。这意味着早先的 extern 声明会优先于函数定义的签名，从而可能导致代码生成失败，例如两个声明的参数名称不同时。这个问题有多种修复方法，你可以尝试自己提出方案！下面是一个测试用例：</p><div class="code-title">Kaleidoscope / LLVM IR · 原代码保留</div><pre><code>extern foo(a);     # ok, defines foo.
+def foo(b) b;      # Error: Unknown variable name. (decl using &#x27;a&#x27; takes precedence).
+</code></pre></section><section id="s3.5"><h2>3.5 驱动程序的修改与总结</h2><p>目前，将代码生成为 LLVM IR 并不能直接带来太多能力，主要是让我们可以查看漂亮的 IR 指令。示例代码会在 HandleDefinition、HandleExtern 等函数中加入对 codegen 的调用，然后打印 LLVM IR。这样就能方便地查看简单函数生成的 LLVM IR。例如：</p><div class="code-title">Kaleidoscope / LLVM IR · 原代码保留</div><pre><code>ready&gt; 4+5;
+Read top-level expression:
+define double @__anon_expr() {
+entry:
+  ret double 9.000000e+00
+}
+</code></pre><p>请注意，语法分析器会将顶层表达式转换成匿名函数。这在下一章加入 JIT 支持时非常有用。也请注意，这里的代码几乎完全按照源程序直接翻译，除了 IRBuilder 执行的简单常量折叠之外，没有进行其他优化。下一章我们将显式加入优化功能。</p><div class="code-title">Kaleidoscope / LLVM IR · 原代码保留</div><pre><code>ready&gt; def foo(a b) a*a + 2*a*b + b*b;
+Read function definition:
+define double @foo(double %a, double %b) {
+entry:
+  %multmp = fmul double %a, %a
+  %multmp1 = fmul double 2.000000e+00, %a
+  %multmp2 = fmul double %multmp1, %b
+  %addtmp = fadd double %multmp, %multmp2
+  %multmp3 = fmul double %b, %b
+  %addtmp4 = fadd double %addtmp, %multmp3
+  ret double %addtmp4
+}
+</code></pre><p>这里展示了一些简单的算术运算。注意，它们与我们创建相应指令时调用的 LLVM Builder 方法有着惊人的相似之处。</p><div class="code-title">Kaleidoscope / LLVM IR · 原代码保留</div><pre><code>ready&gt; def bar(a) foo(a, 4.0) + bar(31337);
+Read function definition:
+define double @bar(double %a) {
+entry:
+  %calltmp = call double @foo(double %a, double 4.000000e+00)
+  %calltmp1 = call double @bar(double 3.133700e+04)
+  %addtmp = fadd double %calltmp, %calltmp1
+  ret double %addtmp
+}
+</code></pre><p>这里展示了一些函数调用。注意，如果真的调用这个函数，它会运行很久。以后我们将加入条件控制流，让递归真正变得有用。:)</p><div class="code-title">Kaleidoscope / LLVM IR · 原代码保留</div><pre><code>ready&gt; extern cos(x);
+Read extern:
+declare double @cos(double)
+
+ready&gt; cos(1.234);
+Read top-level expression:
+define double @__anon_expr() {
+entry:
+  %calltmp = call double @cos(double 1.234000e+00)
+  ret double %calltmp
+}
+</code></pre><p>这里展示了对 libm 数学库中 cos 函数的 extern 声明，以及对该函数的一次调用。</p><div class="code-title">Kaleidoscope / LLVM IR · 原代码保留</div><pre><code>ready&gt; ^D
+; ModuleID = &#x27;my cool jit&#x27;
+
+define double @0() {
+entry:
+  %addtmp = fadd double 4.000000e+00, 5.000000e+00
+  ret double %addtmp
+}
+
+define double @foo(double %a, double %b) {
+entry:
+  %multmp = fmul double %a, %a
+  %multmp1 = fmul double 2.000000e+00, %a
+  %multmp2 = fmul double %multmp1, %b
+  %addtmp = fadd double %multmp, %multmp2
+  %multmp3 = fmul double %b, %b
+  %addtmp4 = fadd double %addtmp, %multmp3
+  ret double %addtmp4
+}
+
+define double @bar(double %a) {
+entry:
+  %calltmp = call double @foo(double %a, double 4.000000e+00)
+  %calltmp1 = call double @bar(double 3.133700e+04)
+  %addtmp = fadd double %calltmp, %calltmp1
+  ret double %addtmp
+}
+
+declare double @cos(double)
+
+define double @1() {
+entry:
+  %calltmp = call double @cos(double 1.234000e+00)
+  ret double %calltmp
+}
+</code></pre><p>当你退出当前演示程序时（Linux 中使用 Ctrl+D 发送 EOF，Windows 中使用 Ctrl+Z 再按 Enter），程序会打印整个已生成模块的 IR。现在你可以从整体上看到所有函数以及它们之间的相互引用。</p><p>至此，Kaleidoscope 教程第三章结束。下一章我们将介绍如何加入 JIT 代码生成和优化器支持，从而真正开始执行代码！</p></section><section id="s3.6"><h2>3.6 完整代码清单</h2><p>下面是当前示例加入 LLVM 代码生成器之后的完整源码。因为它使用 LLVM 库，所以编译时需要链接相应的库。为此，我们可以用 llvm-config 工具告诉 Makefile 或命令行应该使用哪些选项：</p><div class="code-title">Bash · 原代码保留</div><pre><code># Compile
+clang++ -g -O3 toy.cpp `llvm-config --cxxflags --ldflags --system-libs --libs core` -o toy
+# Run
+./toy
+</code></pre><p>代码如下：</p><div class="code-title">C++ · 原代码保留</div><pre><code>#include &quot;llvm/ADT/APFloat.h&quot;
+#include &quot;llvm/ADT/STLExtras.h&quot;
+#include &quot;llvm/IR/BasicBlock.h&quot;
+#include &quot;llvm/IR/Constants.h&quot;
+#include &quot;llvm/IR/DerivedTypes.h&quot;
+#include &quot;llvm/IR/Function.h&quot;
+#include &quot;llvm/IR/IRBuilder.h&quot;
+#include &quot;llvm/IR/LLVMContext.h&quot;
+#include &quot;llvm/IR/Module.h&quot;
+#include &quot;llvm/IR/Type.h&quot;
+#include &quot;llvm/IR/Verifier.h&quot;
+#include &lt;algorithm&gt;
+#include &lt;cctype&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+using namespace llvm;
+
+//===----------------------------------------------------------------------===//
+// Lexer
+//===----------------------------------------------------------------------===//
+
+// The lexer returns tokens [0-255] if it is an unknown character, otherwise one
+// of these for known things.
+enum Token {
+  tok_eof = -1,
+
+  // commands
+  tok_def = -2,
+  tok_extern = -3,
+
+  // primary
+  tok_identifier = -4,
+  tok_number = -5
+};
+
+static std::string IdentifierStr; // Filled in if tok_identifier
+static double NumVal;             // Filled in if tok_number
+
+/// gettok - Return the next token from standard input.
+static int gettok() {
+  static int LastChar = &#x27; &#x27;;
+
+  // Skip any whitespace.
+  while (isspace(LastChar))
+    LastChar = getchar();
+
+  if (isalpha(LastChar)) { // identifier: [a-zA-Z][a-zA-Z0-9]*
+    IdentifierStr = LastChar;
+    while (isalnum((LastChar = getchar())))
+      IdentifierStr += LastChar;
+
+    if (IdentifierStr == &quot;def&quot;)
+      return tok_def;
+    if (IdentifierStr == &quot;extern&quot;)
+      return tok_extern;
+    return tok_identifier;
+  }
+
+  if (isdigit(LastChar) || LastChar == &#x27;.&#x27;) { // Number: [0-9.]+
+    std::string NumStr;
+    do {
+      NumStr += LastChar;
+      LastChar = getchar();
+    } while (isdigit(LastChar) || LastChar == &#x27;.&#x27;);
+
+    NumVal = strtod(NumStr.c_str(), nullptr);
+    return tok_number;
+  }
+
+  if (LastChar == &#x27;#&#x27;) {
+    // Comment until end of line.
+    do
+      LastChar = getchar();
+    while (LastChar != EOF &amp;&amp; LastChar != &#x27;\n&#x27; &amp;&amp; LastChar != &#x27;\r&#x27;);
+
+    if (LastChar != EOF)
+      return gettok();
+  }
+
+  // Check for end of file.  Don&#x27;t eat the EOF.
+  if (LastChar == EOF)
+    return tok_eof;
+
+  // Otherwise, just return the character as its ascii value.
+  int ThisChar = LastChar;
+  LastChar = getchar();
+  return ThisChar;
+}
+
+//===----------------------------------------------------------------------===//
+// Abstract Syntax Tree (aka Parse Tree)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// ExprAST - Base class for all expression nodes.
+class ExprAST {
+public:
+  virtual ~ExprAST() = default;
+
+  virtual Value *codegen() = 0;
+};
+
+/// NumberExprAST - Expression class for numeric literals like &quot;1.0&quot;.
+class NumberExprAST : public ExprAST {
+  double Val;
+
+public:
+  NumberExprAST(double Val) : Val(Val) {}
+
+  Value *codegen() override;
+};
+
+/// VariableExprAST - Expression class for referencing a variable, like &quot;a&quot;.
+class VariableExprAST : public ExprAST {
+  std::string Name;
+
+public:
+  VariableExprAST(const std::string &amp;Name) : Name(Name) {}
+
+  Value *codegen() override;
+};
+
+/// BinaryExprAST - Expression class for a binary operator.
+class BinaryExprAST : public ExprAST {
+  char Op;
+  std::unique_ptr&lt;ExprAST&gt; LHS, RHS;
+
+public:
+  BinaryExprAST(char Op, std::unique_ptr&lt;ExprAST&gt; LHS,
+                std::unique_ptr&lt;ExprAST&gt; RHS)
+      : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+
+  Value *codegen() override;
+};
+
+/// CallExprAST - Expression class for function calls.
+class CallExprAST : public ExprAST {
+  std::string Callee;
+  std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args;
+
+public:
+  CallExprAST(const std::string &amp;Callee,
+              std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args)
+      : Callee(Callee), Args(std::move(Args)) {}
+
+  Value *codegen() override;
+};
+
+/// PrototypeAST - This class represents the &quot;prototype&quot; for a function,
+/// which captures its name, and its argument names (thus implicitly the number
+/// of arguments the function takes).
+class PrototypeAST {
+  std::string Name;
+  std::vector&lt;std::string&gt; Args;
+
+public:
+  PrototypeAST(const std::string &amp;Name, std::vector&lt;std::string&gt; Args)
+      : Name(Name), Args(std::move(Args)) {}
+
+  Function *codegen();
+  const std::string &amp;getName() const { return Name; }
+};
+
+/// FunctionAST - This class represents a function definition itself.
+class FunctionAST {
+  std::unique_ptr&lt;PrototypeAST&gt; Proto;
+  std::unique_ptr&lt;ExprAST&gt; Body;
+
+public:
+  FunctionAST(std::unique_ptr&lt;PrototypeAST&gt; Proto,
+              std::unique_ptr&lt;ExprAST&gt; Body)
+      : Proto(std::move(Proto)), Body(std::move(Body)) {}
+
+  Function *codegen();
+};
+
+} // end anonymous namespace
+
+//===----------------------------------------------------------------------===//
+// Parser
+//===----------------------------------------------------------------------===//
+
+/// CurTok/getNextToken - Provide a simple token buffer.  CurTok is the current
+/// token the parser is looking at.  getNextToken reads another token from the
+/// lexer and updates CurTok with its results.
+static int CurTok;
+static int getNextToken() { return CurTok = gettok(); }
+
+/// BinopPrecedence - This holds the precedence for each binary operator that is
+/// defined.
+static std::map&lt;char, int&gt; BinopPrecedence;
+
+/// GetTokPrecedence - Get the precedence of the pending binary operator token.
+static int GetTokPrecedence() {
+  if (!isascii(CurTok))
+    return -1;
+
+  // Make sure it&#x27;s a declared binop.
+  int TokPrec = BinopPrecedence[CurTok];
+  if (TokPrec &lt;= 0)
+    return -1;
+  return TokPrec;
+}
+
+/// LogError* - These are little helper functions for error handling.
+std::unique_ptr&lt;ExprAST&gt; LogError(const char *Str) {
+  fprintf(stderr, &quot;Error: %s\n&quot;, Str);
+  return nullptr;
+}
+
+std::unique_ptr&lt;PrototypeAST&gt; LogErrorP(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+static std::unique_ptr&lt;ExprAST&gt; ParseExpression();
+
+/// numberexpr ::= number
+static std::unique_ptr&lt;ExprAST&gt; ParseNumberExpr() {
+  auto Result = std::make_unique&lt;NumberExprAST&gt;(NumVal);
+  getNextToken(); // consume the number
+  return std::move(Result);
+}
+
+/// parenexpr ::= &#x27;(&#x27; expression &#x27;)&#x27;
+static std::unique_ptr&lt;ExprAST&gt; ParseParenExpr() {
+  getNextToken(); // eat (.
+  auto V = ParseExpression();
+  if (!V)
+    return nullptr;
+
+  if (CurTok != &#x27;)&#x27;)
+    return LogError(&quot;expected &#x27;)&#x27;&quot;);
+  getNextToken(); // eat ).
+  return V;
+}
+
+/// identifierexpr
+///   ::= identifier
+///   ::= identifier &#x27;(&#x27; expression* &#x27;)&#x27;
+static std::unique_ptr&lt;ExprAST&gt; ParseIdentifierExpr() {
+  std::string IdName = IdentifierStr;
+
+  getNextToken(); // eat identifier.
+
+  if (CurTok != &#x27;(&#x27;) // Simple variable ref.
+    return std::make_unique&lt;VariableExprAST&gt;(IdName);
+
+  // Call.
+  getNextToken(); // eat (
+  std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args;
+  if (CurTok != &#x27;)&#x27;) {
+    while (true) {
+      if (auto Arg = ParseExpression())
+        Args.push_back(std::move(Arg));
+      else
+        return nullptr;
+
+      if (CurTok == &#x27;)&#x27;)
+        break;
+
+      if (CurTok != &#x27;,&#x27;)
+        return LogError(&quot;Expected &#x27;)&#x27; or &#x27;,&#x27; in argument list&quot;);
+      getNextToken();
+    }
+  }
+
+  // Eat the &#x27;)&#x27;.
+  getNextToken();
+
+  return std::make_unique&lt;CallExprAST&gt;(IdName, std::move(Args));
+}
+
+/// primary
+///   ::= identifierexpr
+///   ::= numberexpr
+///   ::= parenexpr
+static std::unique_ptr&lt;ExprAST&gt; ParsePrimary() {
+  switch (CurTok) {
+  default:
+    return LogError(&quot;unknown token when expecting an expression&quot;);
+  case tok_identifier:
+    return ParseIdentifierExpr();
+  case tok_number:
+    return ParseNumberExpr();
+  case &#x27;(&#x27;:
+    return ParseParenExpr();
+  }
+}
+
+/// binoprhs
+///   ::= (&#x27;+&#x27; primary)*
+static std::unique_ptr&lt;ExprAST&gt; ParseBinOpRHS(int ExprPrec,
+                                              std::unique_ptr&lt;ExprAST&gt; LHS) {
+  // If this is a binop, find its precedence.
+  while (true) {
+    int TokPrec = GetTokPrecedence();
+
+    // If this is a binop that binds at least as tightly as the current binop,
+    // consume it, otherwise we are done.
+    if (TokPrec &lt; ExprPrec)
+      return LHS;
+
+    // Okay, we know this is a binop.
+    int BinOp = CurTok;
+    getNextToken(); // eat binop
+
+    // Parse the primary expression after the binary operator.
+    auto RHS = ParsePrimary();
+    if (!RHS)
+      return nullptr;
+
+    // If BinOp binds less tightly with RHS than the operator after RHS, let
+    // the pending operator take RHS as its LHS.
+    int NextPrec = GetTokPrecedence();
+    if (TokPrec &lt; NextPrec) {
+      RHS = ParseBinOpRHS(TokPrec + 1, std::move(RHS));
+      if (!RHS)
+        return nullptr;
+    }
+
+    // Merge LHS/RHS.
+    LHS =
+        std::make_unique&lt;BinaryExprAST&gt;(BinOp, std::move(LHS), std::move(RHS));
+  }
+}
+
+/// expression
+///   ::= primary binoprhs
+///
+static std::unique_ptr&lt;ExprAST&gt; ParseExpression() {
+  auto LHS = ParsePrimary();
+  if (!LHS)
+    return nullptr;
+
+  return ParseBinOpRHS(0, std::move(LHS));
+}
+
+/// prototype
+///   ::= id &#x27;(&#x27; id* &#x27;)&#x27;
+static std::unique_ptr&lt;PrototypeAST&gt; ParsePrototype() {
+  if (CurTok != tok_identifier)
+    return LogErrorP(&quot;Expected function name in prototype&quot;);
+
+  std::string FnName = IdentifierStr;
+  getNextToken();
+
+  if (CurTok != &#x27;(&#x27;)
+    return LogErrorP(&quot;Expected &#x27;(&#x27; in prototype&quot;);
+
+  std::vector&lt;std::string&gt; ArgNames;
+  while (getNextToken() == tok_identifier)
+    ArgNames.push_back(IdentifierStr);
+  if (CurTok != &#x27;)&#x27;)
+    return LogErrorP(&quot;Expected &#x27;)&#x27; in prototype&quot;);
+
+  // success.
+  getNextToken(); // eat &#x27;)&#x27;.
+
+  return std::make_unique&lt;PrototypeAST&gt;(FnName, std::move(ArgNames));
+}
+
+/// definition ::= &#x27;def&#x27; prototype expression
+static std::unique_ptr&lt;FunctionAST&gt; ParseDefinition() {
+  getNextToken(); // eat def.
+  auto Proto = ParsePrototype();
+  if (!Proto)
+    return nullptr;
+
+  if (auto E = ParseExpression())
+    return std::make_unique&lt;FunctionAST&gt;(std::move(Proto), std::move(E));
+  return nullptr;
+}
+
+/// toplevelexpr ::= expression
+static std::unique_ptr&lt;FunctionAST&gt; ParseTopLevelExpr() {
+  if (auto E = ParseExpression()) {
+    // Make an anonymous proto.
+    auto Proto = std::make_unique&lt;PrototypeAST&gt;(&quot;__anon_expr&quot;,
+                                                 std::vector&lt;std::string&gt;());
+    return std::make_unique&lt;FunctionAST&gt;(std::move(Proto), std::move(E));
+  }
+  return nullptr;
+}
+
+/// external ::= &#x27;extern&#x27; prototype
+static std::unique_ptr&lt;PrototypeAST&gt; ParseExtern() {
+  getNextToken(); // eat extern.
+  return ParsePrototype();
+}
+
+//===----------------------------------------------------------------------===//
+// Code Generation
+//===----------------------------------------------------------------------===//
+
+static std::unique_ptr&lt;LLVMContext&gt; TheContext;
+static std::unique_ptr&lt;Module&gt; TheModule;
+static std::unique_ptr&lt;IRBuilder&lt;&gt;&gt; Builder;
+static std::map&lt;std::string, Value *&gt; NamedValues;
+
+Value *LogErrorV(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+Value *NumberExprAST::codegen() {
+  return ConstantFP::get(*TheContext, APFloat(Val));
+}
+
+Value *VariableExprAST::codegen() {
+  // Look this variable up in the function.
+  Value *V = NamedValues[Name];
+  if (!V)
+    return LogErrorV(&quot;Unknown variable name&quot;);
+  return V;
+}
+
+Value *BinaryExprAST::codegen() {
+  Value *L = LHS-&gt;codegen();
+  Value *R = RHS-&gt;codegen();
+  if (!L || !R)
+    return nullptr;
+
+  switch (Op) {
+  case &#x27;+&#x27;:
+    return Builder-&gt;CreateFAdd(L, R, &quot;addtmp&quot;);
+  case &#x27;-&#x27;:
+    return Builder-&gt;CreateFSub(L, R, &quot;subtmp&quot;);
+  case &#x27;*&#x27;:
+    return Builder-&gt;CreateFMul(L, R, &quot;multmp&quot;);
+  case &#x27;&lt;&#x27;:
+    L = Builder-&gt;CreateFCmpULT(L, R, &quot;cmptmp&quot;);
+    // Convert bool 0/1 to double 0.0 or 1.0
+    return Builder-&gt;CreateUIToFP(L, Type::getDoubleTy(*TheContext), &quot;booltmp&quot;);
+  default:
+    return LogErrorV(&quot;invalid binary operator&quot;);
+  }
+}
+
+Value *CallExprAST::codegen() {
+  // Look up the name in the global module table.
+  Function *CalleeF = TheModule-&gt;getFunction(Callee);
+  if (!CalleeF)
+    return LogErrorV(&quot;Unknown function referenced&quot;);
+
+  // If argument mismatch error.
+  if (CalleeF-&gt;arg_size() != Args.size())
+    return LogErrorV(&quot;Incorrect # arguments passed&quot;);
+
+  std::vector&lt;Value *&gt; ArgsV;
+  for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+    ArgsV.push_back(Args[i]-&gt;codegen());
+    if (!ArgsV.back())
+      return nullptr;
+  }
+
+  return Builder-&gt;CreateCall(CalleeF, ArgsV, &quot;calltmp&quot;);
+}
+
+Function *PrototypeAST::codegen() {
+  // Make the function type:  double(double,double) etc.
+  std::vector&lt;Type *&gt; Doubles(Args.size(), Type::getDoubleTy(*TheContext));
+  FunctionType *FT =
+      FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false);
+
+  Function *F =
+      Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
+
+  // Set names for all arguments.
+  unsigned Idx = 0;
+  for (auto &amp;Arg : F-&gt;args())
+    Arg.setName(Args[Idx++]);
+
+  return F;
+}
+
+Function *FunctionAST::codegen() {
+  // First, check for an existing function from a previous &#x27;extern&#x27; declaration.
+  Function *TheFunction = TheModule-&gt;getFunction(Proto-&gt;getName());
+
+  if (!TheFunction)
+    TheFunction = Proto-&gt;codegen();
+
+  if (!TheFunction)
+    return nullptr;
+
+  if (!TheFunction-&gt;empty())
+    return (Function *)LogErrorV(&quot;Function cannot be redefined.&quot;);
+
+  // Create a new basic block to start insertion into.
+  BasicBlock *BB = BasicBlock::Create(*TheContext, &quot;entry&quot;, TheFunction);
+  Builder-&gt;SetInsertPoint(BB);
+
+  // Record the function arguments in the NamedValues map.
+  NamedValues.clear();
+  for (auto &amp;Arg : TheFunction-&gt;args())
+    NamedValues[std::string(Arg.getName())] = &amp;Arg;
+
+  if (Value *RetVal = Body-&gt;codegen()) {
+    // Finish off the function.
+    Builder-&gt;CreateRet(RetVal);
+
+    // Validate the generated code, checking for consistency.
+    verifyFunction(*TheFunction);
+
+    return TheFunction;
+  }
+
+  // Error reading body, remove function.
+  TheFunction-&gt;eraseFromParent();
+  return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// Top-Level parsing and JIT Driver
+//===----------------------------------------------------------------------===//
+
+static void InitializeModule() {
+  // Open a new context and module.
+  TheContext = std::make_unique&lt;LLVMContext&gt;();
+  TheModule = std::make_unique&lt;Module&gt;(&quot;my cool jit&quot;, *TheContext);
+
+  // Create a new builder for the module.
+  Builder = std::make_unique&lt;IRBuilder&lt;&gt;&gt;(*TheModule);
+}
+
+static void HandleDefinition() {
+  if (auto FnAST = ParseDefinition()) {
+    if (auto *FnIR = FnAST-&gt;codegen()) {
+      fprintf(stderr, &quot;Read function definition:&quot;);
+      FnIR-&gt;print(errs());
+      fprintf(stderr, &quot;\n&quot;);
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+static void HandleExtern() {
+  if (auto ProtoAST = ParseExtern()) {
+    if (auto *FnIR = ProtoAST-&gt;codegen()) {
+      fprintf(stderr, &quot;Read extern: &quot;);
+      FnIR-&gt;print(errs());
+      fprintf(stderr, &quot;\n&quot;);
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+static void HandleTopLevelExpression() {
+  // Evaluate a top-level expression into an anonymous function.
+  if (auto FnAST = ParseTopLevelExpr()) {
+    if (auto *FnIR = FnAST-&gt;codegen()) {
+      fprintf(stderr, &quot;Read top-level expression:&quot;);
+      FnIR-&gt;print(errs());
+      fprintf(stderr, &quot;\n&quot;);
+
+      // Remove the anonymous expression.
+      FnIR-&gt;eraseFromParent();
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+/// top ::= definition | external | expression | &#x27;;&#x27;
+static void MainLoop() {
+  while (true) {
+    fprintf(stderr, &quot;ready&gt; &quot;);
+    switch (CurTok) {
+    case tok_eof:
+      return;
+    case &#x27;;&#x27;: // ignore top-level semicolons.
+      getNextToken();
+      break;
+    case tok_def:
+      HandleDefinition();
+      break;
+    case tok_extern:
+      HandleExtern();
+      break;
+    default:
+      HandleTopLevelExpression();
+      break;
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Main driver code.
+//===----------------------------------------------------------------------===//
+
+int main() {
+  // Install standard binary operators.
+  // 1 is lowest precedence.
+  BinopPrecedence[&#x27;&lt;&#x27;] = 10;
+  BinopPrecedence[&#x27;+&#x27;] = 20;
+  BinopPrecedence[&#x27;-&#x27;] = 20;
+  BinopPrecedence[&#x27;*&#x27;] = 40; // highest.
+
+  // Prime the first token.
+  fprintf(stderr, &quot;ready&gt; &quot;);
+  getNextToken();
+
+  // Make the module, which holds all the code.
+  InitializeModule();
+
+  // Run the main &quot;interpreter loop&quot; now.
+  MainLoop();
+
+  // Print out all of the generated code.
+  TheModule-&gt;print(errs(), nullptr);
+
+  return 0;
+}
+</code></pre><p>下一章：添加 JIT 与优化器支持</p></section></body></html>

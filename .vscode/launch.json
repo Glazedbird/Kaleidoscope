@@ -1,0 +1,22 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Kaleidoscope: 断点观察 AST（终端输入）",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/kaleidoscope",
+            "args": ["--dump-ast"],
+            "stopAtEntry": true,
+            "cwd": "${workspaceFolder}",
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "preLaunchTask": "Kaleidoscope: build debug",
+            "setupCommands": [
+                { "text": "-enable-pretty-printing", "ignoreFailures": true },
+                { "text": "set print object on" }
+            ]
+        }
+    ]
+}
