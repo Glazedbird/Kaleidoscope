@@ -81,10 +81,65 @@ class CliTests(unittest.TestCase):
             "tok_eof",
         ])
 
-    def test_invalid_option(self):
-        result = run("", "--unknown")
+    def test_dump_ast(self):
+        result = run(
+            "def combine(x y) x + y * 2; extern clock(); foo(1, bar(2));",
+            "--dump-ast",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout, """Parsed a function definition: combine
+Function
+  Prototype combine(x, y)
+  Binary '+'
+    Variable x
+    Binary '*'
+      Variable y
+      Number 2
+Parsed an extern: clock
+Prototype clock()
+Parsed a top-level expression
+Function
+  Prototype __anon_expr()
+  Call foo
+    Number 1
+    Call bar
+      Number 2
+""")
+
+    def test_dump_ast_grouping(self):
+        for source, tree in (
+            ("(1 + 2) * 3;", "  Binary '*'\n    Binary '+'\n      Number 1\n      Number 2\n    Number 3\n"),
+            ("10 - 3 - 2;", "  Binary '-'\n    Binary '-'\n      Number 10\n      Number 3\n    Number 2\n"),
+            ("empty();", "  Call empty\n"),
+        ):
+            with self.subTest(source=source):
+                result = run(source, "--dump-ast")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout,
+                                 "Parsed a top-level expression\nFunction\n"
+                                 "  Prototype __anon_expr()\n" + tree)
+
+    def test_dump_ast_error_recovery(self):
+        result = run("1 + ; 2;", "--dump-ast")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("Usage:", result.stderr)
+        self.assertIn("Error:", result.stderr)
+        self.assertEqual(result.stdout, """Parsed a top-level expression
+Function
+  Prototype __anon_expr()
+  Number 2
+""")
+
+    def test_dump_ast_empty_input(self):
+        result = run("# no AST\n;;;", "--dump-ast")
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+
+    def test_invalid_option(self):
+        for args in (("--unknown",), ("--tokens", "--dump-ast")):
+            with self.subTest(args=args):
+                result = run("", *args)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("Usage:", result.stderr)
 
 
 if __name__ == "__main__":

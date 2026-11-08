@@ -38,6 +38,7 @@ int GetTokPrecedence() {
 // numberexpr ::= number
 std::unique_ptr<ExprAST> ParseNumberExpr() {
     auto Result = std::make_unique<NumberExprAST>(NumVal);
+    // 它这种地方会完成 Parse
     getNextToken(); // 消费数字。
     return Result;
 }
@@ -99,6 +100,7 @@ std::unique_ptr<ExprAST> ParsePrimary() {
 // 先递归合并右侧子树；相同优先级继续循环，从而保持左结合。
 std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
                                        std::unique_ptr<ExprAST> LHS) {
+    // 这个大循环 while true 其实是用来不断循环构造左子树的
     while (true) {
         int TokPrec = GetTokPrecedence();
         if (TokPrec < ExprPrec)
@@ -123,6 +125,7 @@ std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
 // prototype ::= identifier '(' identifier* ')'
 // 与调用实参不同，原型的形参以空白分隔，沿用教程语法。
 std::unique_ptr<PrototypeAST> ParsePrototype() {
+    // 这里的这些内容是循环不定式
     if (CurTok != tok_identifier)
         return LogErrorP("expected function name in prototype");
     std::string Name = IdentifierStr;
@@ -135,6 +138,7 @@ std::unique_ptr<PrototypeAST> ParsePrototype() {
         Args.push_back(IdentifierStr);
     if (CurTok != ')')
         return LogErrorP("expected ')' in prototype");
+    // 这里其实是把上一个字符给吃掉了
     getNextToken();
     return std::make_unique<PrototypeAST>(Name, std::move(Args));
 }
@@ -150,11 +154,13 @@ std::unique_ptr<ExprAST> ParseExpression() {
 }
 
 // definition ::= 'def' prototype expression
+// 这里是 前端看到了一个 def 的关键字，然后就 来了
 std::unique_ptr<FunctionAST> ParseDefinition() {
     getNextToken(); // 消费 'def'。
     auto Proto = ParsePrototype();
     if (!Proto)
         return nullptr;
+    // 这里的 Body 是一个 Parse
     if (auto Body = ParseExpression())
         return std::make_unique<FunctionAST>(std::move(Proto), std::move(Body));
     return nullptr;

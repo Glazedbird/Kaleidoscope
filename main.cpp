@@ -1,7 +1,9 @@
 #include "Parser.h"
+#include "ASTPrinter.h"
 #include "token.h"
 
 #include <cstdio>
+#include <iostream>
 #include <string>
 #include <unistd.h>
 
@@ -41,7 +43,7 @@ void RecoverFromError() {
         getNextToken();
 }
 
-int MainLoop() {
+int MainLoop(bool PrintAST) {
     const bool Interactive = isatty(fileno(stdin));
     bool HadError = false;
     if (Interactive)
@@ -55,21 +57,28 @@ int MainLoop() {
             Parsed = true;
             break;
         case tok_def:
+            // 这里的逻辑是这样的 —— 一旦确定是一个def的声明，这里就要对函数的定义进行Parse 
             if (auto Function = ParseDefinition()) {
                 std::printf("Parsed a function definition: %s\n",
                             Function->getPrototype().getName().c_str());
+                if (PrintAST)
+                    DumpAST(*Function, std::cout);
                 Parsed = true;
             }
             break;
         case tok_extern:
             if (auto Proto = ParseExtern()) {
                 std::printf("Parsed an extern: %s\n", Proto->getName().c_str());
+                if (PrintAST)
+                    DumpAST(*Proto, std::cout);
                 Parsed = true;
             }
             break;
         default:
             if (auto Function = ParseTopLevelExpr()) {
                 std::printf("Parsed a top-level expression\n");
+                if (PrintAST)
+                    DumpAST(*Function, std::cout);
                 Parsed = true;
             }
             break;
@@ -92,9 +101,10 @@ int MainLoop() {
 int main(int argc, char **argv) {
     if (argc == 2 && std::string(argv[1]) == "--tokens")
         return PrintTokens();
-    if (argc != 1) {
-        std::fprintf(stderr, "Usage: %s [--tokens]\n", argv[0]);
+    const bool PrintAST = argc == 2 && std::string(argv[1]) == "--dump-ast";
+    if (argc != 1 && !PrintAST) {
+        std::fprintf(stderr, "Usage: %s [--tokens | --dump-ast]\n", argv[0]);
         return 1;
     }
-    return MainLoop();
+    return MainLoop(PrintAST);
 }
