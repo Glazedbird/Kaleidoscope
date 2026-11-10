@@ -1,6 +1,8 @@
 #include "Parser.h"
 #include "ASTPrinter.h"
 #include "token.h"
+#include "Codegen.h"
+#include "llvm/IR/Function.h"
 
 #include <cstdio>
 #include <iostream>
@@ -43,12 +45,13 @@ void RecoverFromError() {
         getNextToken();
 }
 
-int MainLoop(bool PrintAST) {
+int MainLoop(bool PrintAST, bool GenerateIR) {
     const bool Interactive = isatty(fileno(stdin));
     bool HadError = false;
     if (Interactive)
         std::fprintf(stderr, "ready> ");
     getNextToken();
+    unsigned AnonymousId = 0;
 
     while (CurTok != tok_eof) {
         bool Parsed = false;
@@ -57,29 +60,35 @@ int MainLoop(bool PrintAST) {
             Parsed = true;
             break;
         case tok_def:
-            // 这里的逻辑是这样的 —— 一旦确定是一个def的声明，这里就要对函数的定义进行Parse 
             if (auto Function = ParseDefinition()) {
-                std::printf("Parsed a function definition: %s\n",
+                if (!GenerateIR) std::printf("Parsed a function definition: %s\n",
                             Function->getPrototype().getName().c_str());
                 if (PrintAST)
                     DumpAST(*Function, std::cout);
                 Parsed = true;
+                if (GenerateIR && !Function->codegen()) HadError = true;
             }
             break;
         case tok_extern:
             if (auto Proto = ParseExtern()) {
-                std::printf("Parsed an extern: %s\n", Proto->getName().c_str());
+                if (!GenerateIR) std::printf("Parsed an extern: %s\n", Proto->getName().c_str());
                 if (PrintAST)
                     DumpAST(*Proto, std::cout);
                 Parsed = true;
+                if (GenerateIR && !Proto->codegen()) HadError = true;
             }
             break;
         default:
             if (auto Function = ParseTopLevelExpr()) {
-                std::printf("Parsed a top-level expression\n");
+                if (!GenerateIR) std::printf("Parsed a top-level expression\n");
                 if (PrintAST)
                     DumpAST(*Function, std::cout);
                 Parsed = true;
+                if (GenerateIR) {
+                    if (auto *IR = Function->codegen())
+                        IR->setName("__anon_expr." + std::to_string(AnonymousId++));
+                    else HadError = true;
+                }
             }
             break;
         }
@@ -93,6 +102,7 @@ int MainLoop(bool PrintAST) {
         if (CurTok == ';')
             getNextToken();
     }
+    if (GenerateIR && !HadError && !EmitModule()) HadError = true;
     return HadError ? 1 : 0;
 }
 
@@ -102,9 +112,11 @@ int main(int argc, char **argv) {
     if (argc == 2 && std::string(argv[1]) == "--tokens")
         return PrintTokens();
     const bool PrintAST = argc == 2 && std::string(argv[1]) == "--dump-ast";
-    if (argc != 1 && !PrintAST) {
-        std::fprintf(stderr, "Usage: %s [--tokens | --dump-ast]\n", argv[0]);
+    const bool GenerateIR = argc == 2 && std::string(argv[1]) == "--emit-ir";
+    if (argc != 1 && !PrintAST && !GenerateIR) {
+        std::fprintf(stderr, "Usage: %s [--tokens | --dump-ast | --emit-ir]\n", argv[0]);
         return 1;
     }
-    return MainLoop(PrintAST);
+    if (GenerateIR) InitializeModule();
+    return MainLoop(PrintAST, GenerateIR);
 }

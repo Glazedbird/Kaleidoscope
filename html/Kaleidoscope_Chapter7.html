@@ -1,0 +1,1837 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LLVM Kaleidoscope 第 7 章：可变变量（中文翻译）</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;line-height:1.85;color:#242a35;background:#fff;max-width:920px;margin:0 auto;padding:42px 25px}h1{font-size:2rem;line-height:1.4;margin-bottom:8px}h2{font-size:1.5rem;border-bottom:1px solid #dae0e6;padding:24px 0 10px;margin-top:38px}p{margin:17px 0;font-size:16px}pre{background:#f4f6f9;border:1px solid #e1e6eb;border-radius:0 0 9px 9px;padding:17px;overflow:auto;line-height:1.5;font-size:13px;tab-size:2;margin-top:0}code{font-family:Consolas,"DejaVu Sans Mono",monospace}.code-title{background:#e9edf3;border-radius:9px 9px 0 0;padding:4px 14px;font-size:12px;color:#526174;margin-top:20px}nav{display:flex;flex-wrap:wrap;gap:10px;margin:24px 0;padding:18px;background:#f5f7fa;border-radius:10px}nav a{color:#1656a5;text-decoration:none;font-size:14px}blockquote{border-left:3px solid #888;padding-left:15px}.note{color:#546170;font-size:14px}a{color:#1656a5}@media print{body{padding:0}pre{white-space:pre-wrap;word-wrap:break-word}section{break-inside:auto}}h3{margin-top:30px}img{max-width:100%;height:auto}footer{border-top:1px solid #dae0e6;margin-top:40px;padding-top:15px;font-size:13px;color:#546170}li{margin:8px 0}</style></head><body><h1 id="kaleidoscope-extending-the-language-mutable-variables">第七章：Kaleidoscope——扩展语言：可变变量</h1><p class="note">根据 <a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl07.html">LLVM 官方第 7 章</a>翻译（原文获取日期：2026-11-10）。正文与各节说明译为中文；C++、LLVM IR、命令及输出完整保留原文。版式参考本项目第 3 章。原文可能使用比本项目 LLVM 18 更新的 API，应配合所安装版本的教程阅读；本页代码不是当前主程序已实现功能的声明。</p><nav aria-label="章节导航"><a href="index.html">目录</a><a href="Kaleidoscope_Chapter3.html">第 3 章：生成 LLVM IR</a><a href="Kaleidoscope_Chapter4.html">第 4 章：添加 JIT 和优化器支持</a><a href="Kaleidoscope_Chapter5.html">第 5 章：控制流</a><a href="Kaleidoscope_Chapter6.html">第 6 章：用户自定义运算符</a><a href="Kaleidoscope_Chapter8.html">第 8 章：编译为目标文件</a><a href="Kaleidoscope_Chapter9.html">第 9 章：添加调试信息</a><a href="Kaleidoscope_Chapter10.html">第 10 章：总结与实用知识</a></nav><nav aria-label="本章目录"><a href="#chapter-7-introduction">7.1 第七章简介</a><a href="#why-is-this-a-hard-problem">7.2 为什么这是一个难题？</a><a href="#memory-in-llvm">7.3 LLVM 中的内存</a><a href="#mutable-variables-in-kaleidoscope">7.4 Kaleidoscope 中的可变变量</a><a href="#adjusting-existing-variables-for-mutation">7.5 调整已有变量以支持修改</a><a href="#new-assignment-operator">7.6 新的赋值运算符</a><a href="#user-defined-local-variables">7.7 用户定义的局部变量</a><a href="#full-code-listing">7.8 完整代码清单</a></nav><h2 id="chapter-7-introduction">7.1 第七章简介</h2>
+<p>欢迎来到《使用 LLVM 实现一门语言》第七章。前六章构建了一门简单但相当完整的函数式语言，介绍了解析技术、AST 的构建与表示、LLVM IR 生成、优化和即时编译。</p>
+<p>函数式 Kaleidoscope 很有意思，但它也让生成 LLVM IR 变得过于容易：可以直接构造 SSA 形式。LLVM 要求输入 IR 使用 SSA，因此初学者常常不清楚该如何为具有可变变量的命令式语言生成代码。</p>
+<p>本章的好消息是：前端无需自行构造 SSA。LLVM 提供了经过充分优化和测试的支持，只是实现方式可能有些出乎意料。</p>
+<h2 id="why-is-this-a-hard-problem">7.2 为什么这是一个难题？</h2>
+<p>看看这个简单的 C 例子，理解可变变量为何让 SSA 构造变复杂：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>int G, H;
+int test(_Bool Condition) {
+  int X;
+  if (Condition)
+    X = G;
+  else
+    X = H;
+  return X;
+}
+</code></pre>
+<p>X 的值取决于程序经过哪条执行路径。在 return 前有两个可能值，因此需要 PHI 节点把它们合并。希望得到的 LLVM IR 如下：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>@G = weak global i32 0   ; type of @G is i32*
+@H = weak global i32 0   ; type of @H is i32*
+
+define i32 @test(i1 %Condition) {
+entry:
+  br i1 %Condition, label %cond_true, label %cond_false
+
+cond_true:
+  %X.0 = load i32, i32* @G
+  br label %cond_next
+
+cond_false:
+  %X.1 = load i32, i32* @H
+  br label %cond_next
+
+cond_next:
+  %X.2 = phi i32 [ %X.1, %cond_false ], [ %X.0, %cond_true ]
+  ret i32 %X.2
+}
+</code></pre>
+<p>对全局变量 G 和 H 的读取在 IR 中显式表示，分别位于 cond_true 和 cond_false。合并块 cond_next 中的 X.2 Phi 根据前驱选择值：从 cond_false 来时取 X.1，从 cond_true 来时取 X.0。本章不展开 SSA 的细节，可参考相关在线资料。</p>
+<p>这里关注的是：降低可变变量赋值时，由谁插入 Phi？LLVM IR 必须采用 SSA，没有“非 SSA 模式”。但 SSA 构造需要并不简单的算法与数据结构，让每个前端重复实现既不方便，也浪费精力。</p>
+<h2 id="memory-in-llvm">7.3 LLVM 中的内存</h2>
+<p>诀窍在于：LLVM 要求寄存器值满足 SSA，但不要求、也不允许用相同方式对内存对象进行 SSA 命名。上例中对 G、H 的读取直接访问原对象，没有重命名或版本化。这不同于某些编译器系统；LLVM 不把内存数据流直接编码在 IR 中，而通过按需计算的分析 pass 处理。</p>
+<p>因此，可以为函数中的每个可变对象创建一个位于内存中的栈变量。先看看 LLVM 如何表示它。</p>
+<p>LLVM 用显式 load/store 指令访问内存，不需要单独的“取地址”运算符。原文的带类型指针表示中，虽然 G、H 保存的是 i32，其名称类型却是 i32*，因为名称引用的是存储空间地址。栈变量也是如此，只不过通过 alloca 指令声明。译注：新版本 LLVM 的不透明指针写作 ptr；以下代码保留原文表示。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>define i32 @example() {
+entry:
+  %X = alloca i32           ; type of %X is i32*.
+  ...
+  %tmp = load i32, i32* %X  ; load the stack value %X from the stack.
+  %tmp2 = add i32 %tmp, 1   ; increment it
+  store i32 %tmp2, i32* %X  ; store it back
+  ...
+</code></pre>
+<p>这段代码展示了如何声明和操作栈变量。alloca 分配的地址可以传给函数，也可以存入其他变量。前面的例子可改写成下面的形式，无需显式 PHI：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>@G = weak global i32 0   ; type of @G is i32*
+@H = weak global i32 0   ; type of @H is i32*
+
+define i32 @test(i1 %Condition) {
+entry:
+  %X = alloca i32           ; type of %X is i32*.
+  br i1 %Condition, label %cond_true, label %cond_false
+
+cond_true:
+  %X.0 = load i32, i32* @G
+  store i32 %X.0, i32* %X   ; Update X
+  br label %cond_next
+
+cond_false:
+  %X.1 = load i32, i32* @H
+  store i32 %X.1, i32* %X   ; Update X
+  br label %cond_next
+
+cond_next:
+  %X.2 = load i32, i32* %X  ; Read X
+  ret i32 %X.2
+}
+</code></pre>
+<p>这样就得到一种处理任意可变变量的方法，不必亲自创建 Phi：</p>
+<p>每个可变变量对应一次栈分配。</p>
+<p>每次读取变量，对应从栈中 load。</p>
+<p>每次更新变量，对应向栈中 store。</p>
+<p>获取变量地址时，直接使用栈地址。</p>
+<p>眼前的问题解决了，却似乎引入大量栈访问，可能严重影响性能。LLVM 的 mem2reg 优化 pass 正好处理这种情况：把符合条件的 alloca 提升为 SSA 寄存器，并在必要处插入 Phi。对示例运行该 pass，可得到：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>$ llvm-as &lt; example.ll | opt -passes=mem2reg | llvm-dis
+@G = weak global i32 0
+@H = weak global i32 0
+
+define i32 @test(i1 %Condition) {
+entry:
+  br i1 %Condition, label %cond_true, label %cond_false
+
+cond_true:
+  %X.0 = load i32, i32* @G
+  br label %cond_next
+
+cond_false:
+  %X.1 = load i32, i32* @H
+  br label %cond_next
+
+cond_next:
+  %X.01 = phi i32 [ %X.1, %cond_false ], [ %X.0, %cond_true ]
+  ret i32 %X.01
+}
+</code></pre>
+<p>mem2reg 使用标准的“迭代支配边界”算法构造 SSA，并针对常见简单情况做了许多加速优化。推荐依赖它处理可变变量，但需要满足以下条件：</p>
+<p>mem2reg 以 alloca 为处理对象，能提升的才会提升；它不处理全局变量或堆分配。</p>
+<p>它只查找函数入口块中的 alloca。放在入口块可保证分配只执行一次，从而简化分析。</p>
+<p>alloca 的用途必须是直接 load/store。若把栈对象地址传给函数，或涉及其他指针运算，该对象就不会被提升。</p>
+<p>它处理一等值类型的分配，例如指针、标量和向量，并要求分配元素数为 1，或在 .ll 中省略该数量。它不能直接将结构体、数组提升到寄存器；更强的 sroa pass 在许多情况下可以处理结构体、联合体和数组。</p>
+<p>多数命令式语言很容易满足这些要求，下面会用 Kaleidoscope 展示。你可能仍想直接在前端构造 SSA，省去 mem2reg；除非有特别充分的理由，否则推荐采用这里的方法，因为它具有以下优势：</p>
+<p>成熟且经过充分测试：Clang 用它处理局部可变变量，LLVM 的主要用户也广泛依赖这条路径，因此问题容易被及时发现和修复。</p>
+<p>速度很快：mem2reg 对只在单个块中使用、只有一个赋值点等常见情况提供快速路径，并用启发式方法避免不必要的 Phi。</p>
+<p>便于生成调试信息：变量地址可用于关联调试信息，这种实现与 LLVM 的变量调试描述自然配合。</p>
+<p>它也让前端更容易尽快跑起来，实现非常简单。现在为 Kaleidoscope 添加可变变量！</p>
+<h2 id="mutable-variables-in-kaleidoscope">7.4 Kaleidoscope 中的可变变量</h2>
+<p>明确问题后，我们为这门小语言加入两项功能：</p>
+<p>通过 = 运算符修改变量。</p>
+<p>定义新变量。</p>
+<p>第一项是本章重点，但目前只有函数参数和循环归纳变量，修改它们的用途有限。无论是否修改值，定义新变量本身都很有用。下面展示目标用法：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code># Define &#x27;:&#x27; for sequencing: as a low-precedence operator that ignores operands
+# and just returns the RHS.
+def binary : 1 (x y) y;
+
+# Recursive fib, we could do this before.
+def fib(x)
+  if (x &lt; 3) then
+    1
+  else
+    fib(x-1)+fib(x-2);
+
+# Iterative fib.
+def fibi(x)
+  var a = 1, b = 1, c in
+  (for i = 3, i &lt; x in
+     c = a + b :
+     a = b :
+     b = c) :
+  b;
+
+# Call it.
+fibi(10);
+</code></pre>
+<p>先把已有变量改成 alloca 形式，再加入赋值运算符，最后支持新变量定义。</p>
+<h2 id="adjusting-existing-variables-for-mutation">7.5 调整已有变量以支持修改</h2>
+<p>NamedValues 在代码生成期间管理符号表，目前映射到保存 double 值的 LLVM Value*。为支持修改，要让它保存变量的内存位置。这首先是一项重构：只改变实现结构，本身不改变编译器行为，而且所有改动都集中在代码生成器中。</p>
+<p>当前变量只有函数参数与 for 循环归纳变量。为了保持一致，它们和新定义变量一样允许被修改，因此都需要内存位置。</p>
+<p>把 NamedValues 的值类型从 Value* 改为 AllocaInst*。随后 C++ 编译器会指出还需修改哪些位置：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>static std::map&lt;std::string, AllocaInst*&gt; NamedValues;
+</code></pre>
+<p>再添加辅助函数，确保所有 alloca 都创建在函数入口块：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>/// CreateEntryBlockAlloca - Create an alloca instruction in the entry block of
+/// the function.  This is used for mutable variables etc.
+static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction,
+                                          StringRef VarName) {
+  IRBuilder&lt;&gt; TmpB(&amp;TheFunction-&gt;getEntryBlock(),
+                 TheFunction-&gt;getEntryBlock().begin());
+  return TmpB.CreateAlloca(Type::getDoubleTy(*TheContext), nullptr,
+                           VarName);
+}
+</code></pre>
+<p>它创建一个临时 IRBuilder，指向入口块的第一条指令，然后插入指定名称的 alloca 并返回。Kaleidoscope 中所有值均为 double，因此辅助函数无需接收类型参数。</p>
+<p>变量改存到栈上后，变量引用必须生成对栈槽的 load：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>Value *VariableExprAST::codegen() {
+  // Look this variable up in the function.
+  AllocaInst *A = NamedValues[Name];
+  if (!A)
+    return LogErrorV(&quot;Unknown variable name&quot;);
+
+  // Load the value.
+  return Builder-&gt;CreateLoad(A-&gt;getAllocatedType(), A, Name.c_str());
+}
+</code></pre>
+<p>随后调整变量定义的位置，让它们创建 alloca。先修改 ForExprAST::codegen()，完整内容见本章末尾：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>Function *TheFunction = Builder-&gt;GetInsertBlock()-&gt;getParent();
+
+// Create an alloca for the variable in the entry block.
+AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+
+// Emit the start code first, without &#x27;variable&#x27; in scope.
+Value *StartVal = Start-&gt;codegen();
+if (!StartVal)
+  return nullptr;
+
+// Store the value into the alloca.
+Builder-&gt;CreateStore(StartVal, Alloca);
+...
+
+// Compute the end condition.
+Value *EndCond = End-&gt;codegen();
+if (!EndCond)
+  return nullptr;
+
+// Reload, increment, and restore the alloca.  This handles the case where
+// the body of the loop mutates the variable.
+Value *CurVar = Builder-&gt;CreateLoad(Alloca-&gt;getAllocatedType(), Alloca,
+                                    VarName.c_str());
+Value *NextVar = Builder-&gt;CreateFAdd(CurVar, StepVal, &quot;nextvar&quot;);
+Builder-&gt;CreateStore(NextVar, Alloca);
+...
+</code></pre>
+<p>这与修改前的代码几乎相同，主要变化是不再手工创建 PHI，而是在需要时用 load/store 访问变量。</p>
+<p>为了允许修改参数，也要为每个参数创建 alloca：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>Function *FunctionAST::codegen() {
+  ...
+  Builder-&gt;SetInsertPoint(BB);
+
+  // Record the function arguments in the NamedValues map.
+  NamedValues.clear();
+  for (auto &amp;Arg : TheFunction-&gt;args()) {
+    // Create an alloca for this variable.
+    AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, Arg.getName());
+
+    // Store the initial value into the alloca.
+    Builder-&gt;CreateStore(&amp;Arg, Alloca);
+
+    // Add arguments to variable symbol table.
+    NamedValues[std::string(Arg.getName())] = Alloca;
+  }
+
+  if (Value *RetVal = Body-&gt;codegen()) {
+    ...
+</code></pre>
+<p>对每个参数分配栈槽，把传入值存进去，并把该槽登记为参数的内存位置。这段逻辑在 FunctionAST::codegen() 建好入口块后执行。</p>
+<p>最后加入 mem2reg pass，重新获得高效的代码：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>// Promote allocas to registers.
+TheFPM-&gt;addPass(PromotePass());
+// Do simple &quot;peephole&quot; optimizations and bit-twiddling optzns.
+TheFPM-&gt;addPass(InstCombinePass());
+// Reassociate expressions.
+TheFPM-&gt;addPass(ReassociatePass());
+...
+</code></pre>
+<p>对比优化前后的代码很有帮助。以递归 fib 为例，优化前如下：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>define double @fib(double %x) {
+entry:
+  %x1 = alloca double
+  store double %x, double* %x1
+  %x2 = load double, double* %x1
+  %cmptmp = fcmp ult double %x2, 3.000000e+00
+  %booltmp = uitofp i1 %cmptmp to double
+  %ifcond = fcmp one double %booltmp, 0.000000e+00
+  br i1 %ifcond, label %then, label %else
+
+then:       ; preds = %entry
+  br label %ifcont
+
+else:       ; preds = %entry
+  %x3 = load double, double* %x1
+  %subtmp = fsub double %x3, 1.000000e+00
+  %calltmp = call double @fib(double %subtmp)
+  %x4 = load double, double* %x1
+  %subtmp5 = fsub double %x4, 2.000000e+00
+  %calltmp6 = call double @fib(double %subtmp5)
+  %addtmp = fadd double %calltmp, %calltmp6
+  br label %ifcont
+
+ifcont:     ; preds = %else, %then
+  %iftmp = phi double [ 1.000000e+00, %then ], [ %addtmp, %else ]
+  ret double %iftmp
+}
+</code></pre>
+<p>这里只有一个变量，即参数 x，但可以清楚看到这种朴素策略：入口处分配 alloca、保存初值，每次引用都重新 load。if/then/else 没有修改，仍然直接插入 PHI；虽然也可以用栈槽表示其结果，但这里直接构建 Phi 更简单。</p>
+<p>mem2reg 执行后得到：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>define double @fib(double %x) {
+entry:
+  %cmptmp = fcmp ult double %x, 3.000000e+00
+  %booltmp = uitofp i1 %cmptmp to double
+  %ifcond = fcmp one double %booltmp, 0.000000e+00
+  br i1 %ifcond, label %then, label %else
+
+then:
+  br label %ifcont
+
+else:
+  %subtmp = fsub double %x, 1.000000e+00
+  %calltmp = call double @fib(double %subtmp)
+  %subtmp5 = fsub double %x, 2.000000e+00
+  %calltmp6 = call double @fib(double %subtmp5)
+  %addtmp = fadd double %calltmp, %calltmp6
+  br label %ifcont
+
+ifcont:     ; preds = %else, %then
+  %iftmp = phi double [ 1.000000e+00, %then ], [ %addtmp, %else ]
+  ret double %iftmp
+}
+</code></pre>
+<p>由于没有重新赋值，这对 mem2reg 来说十分简单。这个例子说明，不必担心前端先生成明显低效的栈访问代码。</p>
+<p>再运行其余优化，得到：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>define double @fib(double %x) {
+entry:
+  %cmptmp = fcmp ult double %x, 3.000000e+00
+  %booltmp = uitofp i1 %cmptmp to double
+  %ifcond = fcmp ueq double %booltmp, 0.000000e+00
+  br i1 %ifcond, label %else, label %ifcont
+
+else:
+  %subtmp = fsub double %x, 1.000000e+00
+  %calltmp = call double @fib(double %subtmp)
+  %subtmp5 = fsub double %x, 2.000000e+00
+  %calltmp6 = call double @fib(double %subtmp5)
+  %addtmp = fadd double %calltmp, %calltmp6
+  ret double %addtmp
+
+ifcont:
+  ret double 1.000000e+00
+}
+</code></pre>
+<p>simplifycfg 把返回指令复制到了 else 块末尾，从而消除部分分支和 PHI。</p>
+<p>符号表相关访问都改为栈变量后，可以加入赋值运算符了。</p>
+<h2 id="new-assignment-operator">7.6 新的赋值运算符</h2>
+<p>现有框架下，赋值很容易添加：像普通二元运算符一样解析，但由编译器内部处理，不允许用户自行定义。第一步是设置优先级：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>int main() {
+  // Install standard binary operators.
+  // 1 is lowest precedence.
+  BinopPrecedence[&#x27;=&#x27;] = 2;
+  BinopPrecedence[&#x27;&lt;&#x27;] = 10;
+  BinopPrecedence[&#x27;+&#x27;] = 20;
+  BinopPrecedence[&#x27;-&#x27;] = 20;
+</code></pre>
+<p>解析器知道优先级后，便能完成解析和 AST 构建。只需补充赋值的代码生成：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>Value *BinaryExprAST::codegen() {
+  // Special case &#x27;=&#x27; because we don&#x27;t want to emit the LHS as an expression.
+  if (Op == &#x27;=&#x27;) {
+    // This assume we&#x27;re building without RTTI because LLVM builds that way by
+    // default. If you build LLVM with RTTI this can be changed to a
+    // dynamic_cast for automatic error checking.
+    VariableExprAST *LHSE = static_cast&lt;VariableExprAST*&gt;(LHS.get());
+    if (!LHSE)
+      return LogErrorV(&quot;destination of &#x27;=&#x27; must be a variable&quot;);
+</code></pre>
+<p>赋值不同于“生成左值、生成右值、执行运算”的普通二元模式，因此必须提前特殊处理。它还要求左侧是变量，允许 x = expr，不允许 (x+1) = expr。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>  // Codegen the RHS.
+  Value *Val = RHS-&gt;codegen();
+  if (!Val)
+    return nullptr;
+
+  // Look up the name.
+  AllocaInst *Alloca = NamedValues[LHSE-&gt;getName()];
+  if (!Alloca)
+    return LogErrorV(&quot;Unknown variable name&quot;);
+
+  Builder-&gt;CreateStore(Val, Alloca);
+  return Val;
+}
+...
+</code></pre>
+<p>确认变量后，生成右侧表达式、创建 store，并返回刚计算的值。返回值使 X = (Y = Z) 这样的嵌套赋值成为可能。</p>
+<p>现在可以修改循环变量和函数参数，例如：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code># Function to print a double.
+extern printd(x);
+
+# Define &#x27;:&#x27; for sequencing: as a low-precedence operator that ignores operands
+# and just returns the RHS.
+def binary : 1 (x y) y;
+
+def test(x)
+  printd(x) :
+  x = 4 :
+  printd(x);
+
+test(123);
+</code></pre>
+<p>运行结果先打印 123，再打印 4，说明变量确实被修改了。一般情形下，这需要 SSA 构造，而我们已借助 LLVM 完成。接下来加入自定义局部变量，让功能更实用。</p>
+<h2 id="user-defined-local-variables">7.7 用户定义的局部变量</h2>
+<p>var/in 和此前扩展一样，需要改动词法分析器、语法分析器、AST 与代码生成器。先识别 var 关键字：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>enum Token {
+  ...
+  // var definition
+  tok_var = -13
+...
+}
+...
+static int gettok() {
+...
+    if (IdentifierStr == &quot;in&quot;)
+      return tok_in;
+    if (IdentifierStr == &quot;binary&quot;)
+      return tok_binary;
+    if (IdentifierStr == &quot;unary&quot;)
+      return tok_unary;
+    if (IdentifierStr == &quot;var&quot;)
+      return tok_var;
+    return tok_identifier;
+...
+</code></pre>
+<p>然后定义对应 AST 节点：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>/// VarExprAST - Expression class for var/in
+class VarExprAST : public ExprAST {
+  std::vector&lt;std::pair&lt;std::string, std::unique_ptr&lt;ExprAST&gt;&gt;&gt; VarNames;
+  std::unique_ptr&lt;ExprAST&gt; Body;
+
+public:
+  VarExprAST(std::vector&lt;std::pair&lt;std::string, std::unique_ptr&lt;ExprAST&gt;&gt;&gt; VarNames,
+             std::unique_ptr&lt;ExprAST&gt; Body)
+    : VarNames(std::move(VarNames)), Body(std::move(Body)) {}
+
+  Value *codegen() override;
+};
+</code></pre>
+<p>var/in 可以一次定义多个名字，每个名字都可带初始化表达式，相关信息保存在 VarNames 向量中。它还有一个主体表达式，可访问这些新变量。</p>
+<p>先将它接入基本表达式解析：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>/// primary
+///   ::= identifierexpr
+///   ::= numberexpr
+///   ::= parenexpr
+///   ::= ifexpr
+///   ::= forexpr
+///   ::= varexpr
+static std::unique_ptr&lt;ExprAST&gt; ParsePrimary() {
+  switch (CurTok) {
+  default:
+    return LogError(&quot;unknown token when expecting an expression&quot;);
+  case tok_identifier:
+    return ParseIdentifierExpr();
+  case tok_number:
+    return ParseNumberExpr();
+  case &#x27;(&#x27;:
+    return ParseParenExpr();
+  case tok_if:
+    return ParseIfExpr();
+  case tok_for:
+    return ParseForExpr();
+  case tok_var:
+    return ParseVarExpr();
+  }
+}
+</code></pre>
+<p>再定义 ParseVarExpr：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>/// varexpr ::= &#x27;var&#x27; identifier (&#x27;=&#x27; expression)?
+//                    (&#x27;,&#x27; identifier (&#x27;=&#x27; expression)?)* &#x27;in&#x27; expression
+static std::unique_ptr&lt;ExprAST&gt; ParseVarExpr() {
+  getNextToken();  // eat the var.
+
+  std::vector&lt;std::pair&lt;std::string, std::unique_ptr&lt;ExprAST&gt;&gt;&gt; VarNames;
+
+  // At least one variable name is required.
+  if (CurTok != tok_identifier)
+    return LogError(&quot;expected identifier after var&quot;);
+</code></pre>
+<p>前半部分将“标识符—初始化表达式”对解析到局部 VarNames 向量。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>while (true) {
+  std::string Name = IdentifierStr;
+  getNextToken();  // eat identifier.
+
+  // Read the optional initializer.
+  std::unique_ptr&lt;ExprAST&gt; Init;
+  if (CurTok == &#x27;=&#x27;) {
+    getNextToken(); // eat the &#x27;=&#x27;.
+
+    Init = ParseExpression();
+    if (!Init) return nullptr;
+  }
+
+  VarNames.push_back(std::make_pair(Name, std::move(Init)));
+
+  // End of var list, exit loop.
+  if (CurTok != &#x27;,&#x27;) break;
+  getNextToken(); // eat the &#x27;,&#x27;.
+
+  if (CurTok != tok_identifier)
+    return LogError(&quot;expected identifier list after var&quot;);
+}
+</code></pre>
+<p>所有变量解析完后，解析主体并创建 AST：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>  // At this point, we have to have &#x27;in&#x27;.
+  if (CurTok != tok_in)
+    return LogError(&quot;expected &#x27;in&#x27; keyword after &#x27;var&#x27;&quot;);
+  getNextToken();  // eat &#x27;in&#x27;.
+
+  auto Body = ParseExpression();
+  if (!Body)
+    return nullptr;
+
+  return std::make_unique&lt;VarExprAST&gt;(std::move(VarNames),
+                                       std::move(Body));
+}
+</code></pre>
+<p>随后生成 LLVM IR，开头如下：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>Value *VarExprAST::codegen() {
+  std::vector&lt;AllocaInst *&gt; OldBindings;
+
+  Function *TheFunction = Builder-&gt;GetInsertBlock()-&gt;getParent();
+
+  // Register all variables and emit their initializer.
+  for (unsigned i = 0, e = VarNames.size(); i != e; ++i) {
+    const std::string &amp;VarName = VarNames[i].first;
+    ExprAST *Init = VarNames[i].second.get();
+</code></pre>
+<p>遍历变量并逐一安装到符号表。每次替换名称绑定时，把旧值保存在 OldBindings 中。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>  // Emit the initializer before adding the variable to scope, this prevents
+  // the initializer from referencing the variable itself, and permits stuff
+  // like this:
+  //  var a = 1 in
+  //    var a = a in ...   # refers to outer &#x27;a&#x27;.
+  Value *InitVal;
+  if (Init) {
+    InitVal = Init-&gt;codegen();
+    if (!InitVal)
+      return nullptr;
+  } else { // If not specified, use 0.0.
+    InitVal = ConstantFP::get(*TheContext, APFloat(0.0));
+  }
+
+  AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+  Builder-&gt;CreateStore(InitVal, Alloca);
+
+  // Remember the old variable binding so that we can restore the binding when
+  // we unrecurse.
+  OldBindings.push_back(NamedValues[VarName]);
+
+  // Remember this binding.
+  NamedValues[VarName] = Alloca;
+}
+</code></pre>
+<p>核心步骤是：生成初始化表达式、创建 alloca、更新符号表。所有变量就绪后，再计算 var/in 的主体：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>// Codegen the body, now that all vars are in scope.
+Value *BodyVal = Body-&gt;codegen();
+if (!BodyVal)
+  return nullptr;
+</code></pre>
+<p>返回之前恢复旧的变量绑定：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>  // Pop all our variables from scope.
+  for (unsigned i = 0, e = VarNames.size(); i != e; ++i)
+    NamedValues[VarNames[i].first] = OldBindings[i];
+
+  // Return the body computation.
+  return BodyVal;
+}
+</code></pre>
+<p>最终就得到具有正确作用域的局部变量定义，而且自然支持修改它们。</p>
+<p>本章目标已经完成：开头的迭代 fib 可以编译运行，mem2reg 将栈变量提升为 SSA 寄存器并按需插入 PHI，而前端依旧简单，无需自己计算迭代支配边界。</p>
+<h2 id="full-code-listing">7.8 完整代码清单</h2>
+<p>下面是加入可变变量与 var/in 后的完整示例。编译方式如下：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code># Compile
+clang++ -g toy.cpp `llvm-config --cxxflags --ldflags --system-libs --libs core orcjit native` -O3 -o toy
+# Run
+./toy
+</code></pre>
+<p>完整代码如下：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>#include &quot;../include/KaleidoscopeJIT.h&quot;
+#include &quot;llvm/ADT/APFloat.h&quot;
+#include &quot;llvm/ADT/STLExtras.h&quot;
+#include &quot;llvm/IR/BasicBlock.h&quot;
+#include &quot;llvm/IR/Constants.h&quot;
+#include &quot;llvm/IR/DerivedTypes.h&quot;
+#include &quot;llvm/IR/Function.h&quot;
+#include &quot;llvm/IR/IRBuilder.h&quot;
+#include &quot;llvm/IR/Instructions.h&quot;
+#include &quot;llvm/IR/LLVMContext.h&quot;
+#include &quot;llvm/IR/Module.h&quot;
+#include &quot;llvm/IR/PassManager.h&quot;
+#include &quot;llvm/IR/Type.h&quot;
+#include &quot;llvm/IR/Verifier.h&quot;
+#include &quot;llvm/Passes/PassBuilder.h&quot;
+#include &quot;llvm/Passes/StandardInstrumentations.h&quot;
+#include &quot;llvm/Support/TargetSelect.h&quot;
+#include &quot;llvm/Target/TargetMachine.h&quot;
+#include &quot;llvm/Transforms/InstCombine/InstCombine.h&quot;
+#include &quot;llvm/Transforms/Scalar.h&quot;
+#include &quot;llvm/Transforms/Scalar/GVN.h&quot;
+#include &quot;llvm/Transforms/Scalar/Reassociate.h&quot;
+#include &quot;llvm/Transforms/Scalar/SimplifyCFG.h&quot;
+#include &quot;llvm/Transforms/Utils/Mem2Reg.h&quot;
+#include &lt;algorithm&gt;
+#include &lt;cassert&gt;
+#include &lt;cctype&gt;
+#include &lt;cstdint&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;string&gt;
+#include &lt;utility&gt;
+#include &lt;vector&gt;
+
+using namespace llvm;
+using namespace llvm::orc;
+
+//===----------------------------------------------------------------------===//
+// Lexer
+//===----------------------------------------------------------------------===//
+
+// The lexer returns tokens [0-255] if it is an unknown character, otherwise one
+// of these for known things.
+enum Token {
+  tok_eof = -1,
+
+  // commands
+  tok_def = -2,
+  tok_extern = -3,
+
+  // primary
+  tok_identifier = -4,
+  tok_number = -5,
+
+  // control
+  tok_if = -6,
+  tok_then = -7,
+  tok_else = -8,
+  tok_for = -9,
+  tok_in = -10,
+
+  // operators
+  tok_binary = -11,
+  tok_unary = -12,
+
+  // var definition
+  tok_var = -13
+};
+
+static std::string IdentifierStr; // Filled in if tok_identifier
+static double NumVal;             // Filled in if tok_number
+
+/// gettok - Return the next token from standard input.
+static int gettok() {
+  static int LastChar = &#x27; &#x27;;
+
+  // Skip any whitespace.
+  while (isspace(LastChar))
+    LastChar = getchar();
+
+  if (isalpha(LastChar)) { // identifier: [a-zA-Z][a-zA-Z0-9]*
+    IdentifierStr = LastChar;
+    while (isalnum((LastChar = getchar())))
+      IdentifierStr += LastChar;
+
+    if (IdentifierStr == &quot;def&quot;)
+      return tok_def;
+    if (IdentifierStr == &quot;extern&quot;)
+      return tok_extern;
+    if (IdentifierStr == &quot;if&quot;)
+      return tok_if;
+    if (IdentifierStr == &quot;then&quot;)
+      return tok_then;
+    if (IdentifierStr == &quot;else&quot;)
+      return tok_else;
+    if (IdentifierStr == &quot;for&quot;)
+      return tok_for;
+    if (IdentifierStr == &quot;in&quot;)
+      return tok_in;
+    if (IdentifierStr == &quot;binary&quot;)
+      return tok_binary;
+    if (IdentifierStr == &quot;unary&quot;)
+      return tok_unary;
+    if (IdentifierStr == &quot;var&quot;)
+      return tok_var;
+    return tok_identifier;
+  }
+
+  if (isdigit(LastChar) || LastChar == &#x27;.&#x27;) { // Number: [0-9.]+
+    std::string NumStr;
+    do {
+      NumStr += LastChar;
+      LastChar = getchar();
+    } while (isdigit(LastChar) || LastChar == &#x27;.&#x27;);
+
+    NumVal = strtod(NumStr.c_str(), nullptr);
+    return tok_number;
+  }
+
+  if (LastChar == &#x27;#&#x27;) {
+    // Comment until end of line.
+    do
+      LastChar = getchar();
+    while (LastChar != EOF &amp;&amp; LastChar != &#x27;\n&#x27; &amp;&amp; LastChar != &#x27;\r&#x27;);
+
+    if (LastChar != EOF)
+      return gettok();
+  }
+
+  // Check for end of file.  Don&#x27;t eat the EOF.
+  if (LastChar == EOF)
+    return tok_eof;
+
+  // Otherwise, just return the character as its ascii value.
+  int ThisChar = LastChar;
+  LastChar = getchar();
+  return ThisChar;
+}
+
+//===----------------------------------------------------------------------===//
+// Abstract Syntax Tree (aka Parse Tree)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// ExprAST - Base class for all expression nodes.
+class ExprAST {
+public:
+  virtual ~ExprAST() = default;
+
+  virtual Value *codegen() = 0;
+};
+
+/// NumberExprAST - Expression class for numeric literals like &quot;1.0&quot;.
+class NumberExprAST : public ExprAST {
+  double Val;
+
+public:
+  NumberExprAST(double Val) : Val(Val) {}
+
+  Value *codegen() override;
+};
+
+/// VariableExprAST - Expression class for referencing a variable, like &quot;a&quot;.
+class VariableExprAST : public ExprAST {
+  std::string Name;
+
+public:
+  VariableExprAST(const std::string &amp;Name) : Name(Name) {}
+
+  Value *codegen() override;
+  const std::string &amp;getName() const { return Name; }
+};
+
+/// UnaryExprAST - Expression class for a unary operator.
+class UnaryExprAST : public ExprAST {
+  char Opcode;
+  std::unique_ptr&lt;ExprAST&gt; Operand;
+
+public:
+  UnaryExprAST(char Opcode, std::unique_ptr&lt;ExprAST&gt; Operand)
+      : Opcode(Opcode), Operand(std::move(Operand)) {}
+
+  Value *codegen() override;
+};
+
+/// BinaryExprAST - Expression class for a binary operator.
+class BinaryExprAST : public ExprAST {
+  char Op;
+  std::unique_ptr&lt;ExprAST&gt; LHS, RHS;
+
+public:
+  BinaryExprAST(char Op, std::unique_ptr&lt;ExprAST&gt; LHS,
+                std::unique_ptr&lt;ExprAST&gt; RHS)
+      : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+
+  Value *codegen() override;
+};
+
+/// CallExprAST - Expression class for function calls.
+class CallExprAST : public ExprAST {
+  std::string Callee;
+  std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args;
+
+public:
+  CallExprAST(const std::string &amp;Callee,
+              std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args)
+      : Callee(Callee), Args(std::move(Args)) {}
+
+  Value *codegen() override;
+};
+
+/// IfExprAST - Expression class for if/then/else.
+class IfExprAST : public ExprAST {
+  std::unique_ptr&lt;ExprAST&gt; Cond, Then, Else;
+
+public:
+  IfExprAST(std::unique_ptr&lt;ExprAST&gt; Cond, std::unique_ptr&lt;ExprAST&gt; Then,
+            std::unique_ptr&lt;ExprAST&gt; Else)
+      : Cond(std::move(Cond)), Then(std::move(Then)), Else(std::move(Else)) {}
+
+  Value *codegen() override;
+};
+
+/// ForExprAST - Expression class for for/in.
+class ForExprAST : public ExprAST {
+  std::string VarName;
+  std::unique_ptr&lt;ExprAST&gt; Start, End, Step, Body;
+
+public:
+  ForExprAST(const std::string &amp;VarName, std::unique_ptr&lt;ExprAST&gt; Start,
+             std::unique_ptr&lt;ExprAST&gt; End, std::unique_ptr&lt;ExprAST&gt; Step,
+             std::unique_ptr&lt;ExprAST&gt; Body)
+      : VarName(VarName), Start(std::move(Start)), End(std::move(End)),
+        Step(std::move(Step)), Body(std::move(Body)) {}
+
+  Value *codegen() override;
+};
+
+/// VarExprAST - Expression class for var/in
+class VarExprAST : public ExprAST {
+  std::vector&lt;std::pair&lt;std::string, std::unique_ptr&lt;ExprAST&gt;&gt;&gt; VarNames;
+  std::unique_ptr&lt;ExprAST&gt; Body;
+
+public:
+  VarExprAST(
+      std::vector&lt;std::pair&lt;std::string, std::unique_ptr&lt;ExprAST&gt;&gt;&gt; VarNames,
+      std::unique_ptr&lt;ExprAST&gt; Body)
+      : VarNames(std::move(VarNames)), Body(std::move(Body)) {}
+
+  Value *codegen() override;
+};
+
+/// PrototypeAST - This class represents the &quot;prototype&quot; for a function,
+/// which captures its name, and its argument names (thus implicitly the number
+/// of arguments the function takes), as well as if it is an operator.
+class PrototypeAST {
+  std::string Name;
+  std::vector&lt;std::string&gt; Args;
+  bool IsOperator;
+  unsigned Precedence; // Precedence if a binary op.
+
+public:
+  PrototypeAST(const std::string &amp;Name, std::vector&lt;std::string&gt; Args,
+               bool IsOperator = false, unsigned Prec = 0)
+      : Name(Name), Args(std::move(Args)), IsOperator(IsOperator),
+        Precedence(Prec) {}
+
+  Function *codegen();
+  const std::string &amp;getName() const { return Name; }
+
+  bool isUnaryOp() const { return IsOperator &amp;&amp; Args.size() == 1; }
+  bool isBinaryOp() const { return IsOperator &amp;&amp; Args.size() == 2; }
+
+  char getOperatorName() const {
+    assert(isUnaryOp() || isBinaryOp());
+    return Name[Name.size() - 1];
+  }
+
+  unsigned getBinaryPrecedence() const { return Precedence; }
+};
+
+/// FunctionAST - This class represents a function definition itself.
+class FunctionAST {
+  std::unique_ptr&lt;PrototypeAST&gt; Proto;
+  std::unique_ptr&lt;ExprAST&gt; Body;
+
+public:
+  FunctionAST(std::unique_ptr&lt;PrototypeAST&gt; Proto,
+              std::unique_ptr&lt;ExprAST&gt; Body)
+      : Proto(std::move(Proto)), Body(std::move(Body)) {}
+
+  Function *codegen();
+};
+
+} // end anonymous namespace
+
+//===----------------------------------------------------------------------===//
+// Parser
+//===----------------------------------------------------------------------===//
+
+/// CurTok/getNextToken - Provide a simple token buffer.  CurTok is the current
+/// token the parser is looking at.  getNextToken reads another token from the
+/// lexer and updates CurTok with its results.
+static int CurTok;
+static int getNextToken() { return CurTok = gettok(); }
+
+/// BinopPrecedence - This holds the precedence for each binary operator that is
+/// defined.
+static std::map&lt;char, int&gt; BinopPrecedence;
+
+/// GetTokPrecedence - Get the precedence of the pending binary operator token.
+static int GetTokPrecedence() {
+  if (!isascii(CurTok))
+    return -1;
+
+  // Make sure it&#x27;s a declared binop.
+  int TokPrec = BinopPrecedence[CurTok];
+  if (TokPrec &lt;= 0)
+    return -1;
+  return TokPrec;
+}
+
+/// LogError* - These are little helper functions for error handling.
+std::unique_ptr&lt;ExprAST&gt; LogError(const char *Str) {
+  fprintf(stderr, &quot;Error: %s\n&quot;, Str);
+  return nullptr;
+}
+
+std::unique_ptr&lt;PrototypeAST&gt; LogErrorP(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+static std::unique_ptr&lt;ExprAST&gt; ParseExpression();
+
+/// numberexpr ::= number
+static std::unique_ptr&lt;ExprAST&gt; ParseNumberExpr() {
+  auto Result = std::make_unique&lt;NumberExprAST&gt;(NumVal);
+  getNextToken(); // consume the number
+  return std::move(Result);
+}
+
+/// parenexpr ::= &#x27;(&#x27; expression &#x27;)&#x27;
+static std::unique_ptr&lt;ExprAST&gt; ParseParenExpr() {
+  getNextToken(); // eat (.
+  auto V = ParseExpression();
+  if (!V)
+    return nullptr;
+
+  if (CurTok != &#x27;)&#x27;)
+    return LogError(&quot;expected &#x27;)&#x27;&quot;);
+  getNextToken(); // eat ).
+  return V;
+}
+
+/// identifierexpr
+///   ::= identifier
+///   ::= identifier &#x27;(&#x27; expression* &#x27;)&#x27;
+static std::unique_ptr&lt;ExprAST&gt; ParseIdentifierExpr() {
+  std::string IdName = IdentifierStr;
+
+  getNextToken(); // eat identifier.
+
+  if (CurTok != &#x27;(&#x27;) // Simple variable ref.
+    return std::make_unique&lt;VariableExprAST&gt;(IdName);
+
+  // Call.
+  getNextToken(); // eat (
+  std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args;
+  if (CurTok != &#x27;)&#x27;) {
+    while (true) {
+      if (auto Arg = ParseExpression())
+        Args.push_back(std::move(Arg));
+      else
+        return nullptr;
+
+      if (CurTok == &#x27;)&#x27;)
+        break;
+
+      if (CurTok != &#x27;,&#x27;)
+        return LogError(&quot;Expected &#x27;)&#x27; or &#x27;,&#x27; in argument list&quot;);
+      getNextToken();
+    }
+  }
+
+  // Eat the &#x27;)&#x27;.
+  getNextToken();
+
+  return std::make_unique&lt;CallExprAST&gt;(IdName, std::move(Args));
+}
+
+/// ifexpr ::= &#x27;if&#x27; expression &#x27;then&#x27; expression &#x27;else&#x27; expression
+static std::unique_ptr&lt;ExprAST&gt; ParseIfExpr() {
+  getNextToken(); // eat the if.
+
+  // condition.
+  auto Cond = ParseExpression();
+  if (!Cond)
+    return nullptr;
+
+  if (CurTok != tok_then)
+    return LogError(&quot;expected then&quot;);
+  getNextToken(); // eat the then
+
+  auto Then = ParseExpression();
+  if (!Then)
+    return nullptr;
+
+  if (CurTok != tok_else)
+    return LogError(&quot;expected else&quot;);
+
+  getNextToken();
+
+  auto Else = ParseExpression();
+  if (!Else)
+    return nullptr;
+
+  return std::make_unique&lt;IfExprAST&gt;(std::move(Cond), std::move(Then),
+                                      std::move(Else));
+}
+
+/// forexpr ::= &#x27;for&#x27; identifier &#x27;=&#x27; expr &#x27;,&#x27; expr (&#x27;,&#x27; expr)? &#x27;in&#x27; expression
+static std::unique_ptr&lt;ExprAST&gt; ParseForExpr() {
+  getNextToken(); // eat the for.
+
+  if (CurTok != tok_identifier)
+    return LogError(&quot;expected identifier after for&quot;);
+
+  std::string IdName = IdentifierStr;
+  getNextToken(); // eat identifier.
+
+  if (CurTok != &#x27;=&#x27;)
+    return LogError(&quot;expected &#x27;=&#x27; after for&quot;);
+  getNextToken(); // eat &#x27;=&#x27;.
+
+  auto Start = ParseExpression();
+  if (!Start)
+    return nullptr;
+  if (CurTok != &#x27;,&#x27;)
+    return LogError(&quot;expected &#x27;,&#x27; after for start value&quot;);
+  getNextToken();
+
+  auto End = ParseExpression();
+  if (!End)
+    return nullptr;
+
+  // The step value is optional.
+  std::unique_ptr&lt;ExprAST&gt; Step;
+  if (CurTok == &#x27;,&#x27;) {
+    getNextToken();
+    Step = ParseExpression();
+    if (!Step)
+      return nullptr;
+  }
+
+  if (CurTok != tok_in)
+    return LogError(&quot;expected &#x27;in&#x27; after for&quot;);
+  getNextToken(); // eat &#x27;in&#x27;.
+
+  auto Body = ParseExpression();
+  if (!Body)
+    return nullptr;
+
+  return std::make_unique&lt;ForExprAST&gt;(IdName, std::move(Start), std::move(End),
+                                       std::move(Step), std::move(Body));
+}
+
+/// varexpr ::= &#x27;var&#x27; identifier (&#x27;=&#x27; expression)?
+//                    (&#x27;,&#x27; identifier (&#x27;=&#x27; expression)?)* &#x27;in&#x27; expression
+static std::unique_ptr&lt;ExprAST&gt; ParseVarExpr() {
+  getNextToken(); // eat the var.
+
+  std::vector&lt;std::pair&lt;std::string, std::unique_ptr&lt;ExprAST&gt;&gt;&gt; VarNames;
+
+  // At least one variable name is required.
+  if (CurTok != tok_identifier)
+    return LogError(&quot;expected identifier after var&quot;);
+
+  while (true) {
+    std::string Name = IdentifierStr;
+    getNextToken(); // eat identifier.
+
+    // Read the optional initializer.
+    std::unique_ptr&lt;ExprAST&gt; Init = nullptr;
+    if (CurTok == &#x27;=&#x27;) {
+      getNextToken(); // eat the &#x27;=&#x27;.
+
+      Init = ParseExpression();
+      if (!Init)
+        return nullptr;
+    }
+
+    VarNames.push_back(std::make_pair(Name, std::move(Init)));
+
+    // End of var list, exit loop.
+    if (CurTok != &#x27;,&#x27;)
+      break;
+    getNextToken(); // eat the &#x27;,&#x27;.
+
+    if (CurTok != tok_identifier)
+      return LogError(&quot;expected identifier list after var&quot;);
+  }
+
+  // At this point, we have to have &#x27;in&#x27;.
+  if (CurTok != tok_in)
+    return LogError(&quot;expected &#x27;in&#x27; keyword after &#x27;var&#x27;&quot;);
+  getNextToken(); // eat &#x27;in&#x27;.
+
+  auto Body = ParseExpression();
+  if (!Body)
+    return nullptr;
+
+  return std::make_unique&lt;VarExprAST&gt;(std::move(VarNames), std::move(Body));
+}
+
+/// primary
+///   ::= identifierexpr
+///   ::= numberexpr
+///   ::= parenexpr
+///   ::= ifexpr
+///   ::= forexpr
+///   ::= varexpr
+static std::unique_ptr&lt;ExprAST&gt; ParsePrimary() {
+  switch (CurTok) {
+  default:
+    return LogError(&quot;unknown token when expecting an expression&quot;);
+  case tok_identifier:
+    return ParseIdentifierExpr();
+  case tok_number:
+    return ParseNumberExpr();
+  case &#x27;(&#x27;:
+    return ParseParenExpr();
+  case tok_if:
+    return ParseIfExpr();
+  case tok_for:
+    return ParseForExpr();
+  case tok_var:
+    return ParseVarExpr();
+  }
+}
+
+/// unary
+///   ::= primary
+///   ::= &#x27;!&#x27; unary
+static std::unique_ptr&lt;ExprAST&gt; ParseUnary() {
+  // If the current token is not an operator, it must be a primary expr.
+  if (!isascii(CurTok) || CurTok == &#x27;(&#x27; || CurTok == &#x27;,&#x27;)
+    return ParsePrimary();
+
+  // If this is a unary operator, read it.
+  int Opc = CurTok;
+  getNextToken();
+  if (auto Operand = ParseUnary())
+    return std::make_unique&lt;UnaryExprAST&gt;(Opc, std::move(Operand));
+  return nullptr;
+}
+
+/// binoprhs
+///   ::= (&#x27;+&#x27; unary)*
+static std::unique_ptr&lt;ExprAST&gt; ParseBinOpRHS(int ExprPrec,
+                                              std::unique_ptr&lt;ExprAST&gt; LHS) {
+  // If this is a binop, find its precedence.
+  while (true) {
+    int TokPrec = GetTokPrecedence();
+
+    // If this is a binop that binds at least as tightly as the current binop,
+    // consume it, otherwise we are done.
+    if (TokPrec &lt; ExprPrec)
+      return LHS;
+
+    // Okay, we know this is a binop.
+    int BinOp = CurTok;
+    getNextToken(); // eat binop
+
+    // Parse the unary expression after the binary operator.
+    auto RHS = ParseUnary();
+    if (!RHS)
+      return nullptr;
+
+    // If BinOp binds less tightly with RHS than the operator after RHS, let
+    // the pending operator take RHS as its LHS.
+    int NextPrec = GetTokPrecedence();
+    if (TokPrec &lt; NextPrec) {
+      RHS = ParseBinOpRHS(TokPrec + 1, std::move(RHS));
+      if (!RHS)
+        return nullptr;
+    }
+
+    // Merge LHS/RHS.
+    LHS =
+        std::make_unique&lt;BinaryExprAST&gt;(BinOp, std::move(LHS), std::move(RHS));
+  }
+}
+
+/// expression
+///   ::= unary binoprhs
+///
+static std::unique_ptr&lt;ExprAST&gt; ParseExpression() {
+  auto LHS = ParseUnary();
+  if (!LHS)
+    return nullptr;
+
+  return ParseBinOpRHS(0, std::move(LHS));
+}
+
+/// prototype
+///   ::= id &#x27;(&#x27; id* &#x27;)&#x27;
+///   ::= binary LETTER number? (id, id)
+///   ::= unary LETTER (id)
+static std::unique_ptr&lt;PrototypeAST&gt; ParsePrototype() {
+  std::string FnName;
+
+  unsigned Kind = 0; // 0 = identifier, 1 = unary, 2 = binary.
+  unsigned BinaryPrecedence = 30;
+
+  switch (CurTok) {
+  default:
+    return LogErrorP(&quot;Expected function name in prototype&quot;);
+  case tok_identifier:
+    FnName = IdentifierStr;
+    Kind = 0;
+    getNextToken();
+    break;
+  case tok_unary:
+    getNextToken();
+    if (!isascii(CurTok))
+      return LogErrorP(&quot;Expected unary operator&quot;);
+    FnName = &quot;unary&quot;;
+    FnName += (char)CurTok;
+    Kind = 1;
+    getNextToken();
+    break;
+  case tok_binary:
+    getNextToken();
+    if (!isascii(CurTok))
+      return LogErrorP(&quot;Expected binary operator&quot;);
+    FnName = &quot;binary&quot;;
+    FnName += (char)CurTok;
+    Kind = 2;
+    getNextToken();
+
+    // Read the precedence if present.
+    if (CurTok == tok_number) {
+      if (NumVal &lt; 1 || NumVal &gt; 100)
+        return LogErrorP(&quot;Invalid precedence: must be 1..100&quot;);
+      BinaryPrecedence = (unsigned)NumVal;
+      getNextToken();
+    }
+    break;
+  }
+
+  if (CurTok != &#x27;(&#x27;)
+    return LogErrorP(&quot;Expected &#x27;(&#x27; in prototype&quot;);
+
+  std::vector&lt;std::string&gt; ArgNames;
+  while (getNextToken() == tok_identifier)
+    ArgNames.push_back(IdentifierStr);
+  if (CurTok != &#x27;)&#x27;)
+    return LogErrorP(&quot;Expected &#x27;)&#x27; in prototype&quot;);
+
+  // success.
+  getNextToken(); // eat &#x27;)&#x27;.
+
+  // Verify right number of names for operator.
+  if (Kind &amp;&amp; ArgNames.size() != Kind)
+    return LogErrorP(&quot;Invalid number of operands for operator&quot;);
+
+  return std::make_unique&lt;PrototypeAST&gt;(FnName, ArgNames, Kind != 0,
+                                         BinaryPrecedence);
+}
+
+/// definition ::= &#x27;def&#x27; prototype expression
+static std::unique_ptr&lt;FunctionAST&gt; ParseDefinition() {
+  getNextToken(); // eat def.
+  auto Proto = ParsePrototype();
+  if (!Proto)
+    return nullptr;
+
+  if (auto E = ParseExpression())
+    return std::make_unique&lt;FunctionAST&gt;(std::move(Proto), std::move(E));
+  return nullptr;
+}
+
+/// toplevelexpr ::= expression
+static std::unique_ptr&lt;FunctionAST&gt; ParseTopLevelExpr() {
+  if (auto E = ParseExpression()) {
+    // Make an anonymous proto.
+    auto Proto = std::make_unique&lt;PrototypeAST&gt;(&quot;__anon_expr&quot;,
+                                                 std::vector&lt;std::string&gt;());
+    return std::make_unique&lt;FunctionAST&gt;(std::move(Proto), std::move(E));
+  }
+  return nullptr;
+}
+
+/// external ::= &#x27;extern&#x27; prototype
+static std::unique_ptr&lt;PrototypeAST&gt; ParseExtern() {
+  getNextToken(); // eat extern.
+  return ParsePrototype();
+}
+
+//===----------------------------------------------------------------------===//
+// Code Generation
+//===----------------------------------------------------------------------===//
+
+static std::unique_ptr&lt;LLVMContext&gt; TheContext;
+static std::unique_ptr&lt;Module&gt; TheModule;
+static std::unique_ptr&lt;IRBuilder&lt;&gt;&gt; Builder;
+static std::map&lt;std::string, AllocaInst *&gt; NamedValues;
+static std::unique_ptr&lt;KaleidoscopeJIT&gt; TheJIT;
+static std::unique_ptr&lt;FunctionPassManager&gt; TheFPM;
+static std::unique_ptr&lt;LoopAnalysisManager&gt; TheLAM;
+static std::unique_ptr&lt;FunctionAnalysisManager&gt; TheFAM;
+static std::unique_ptr&lt;CGSCCAnalysisManager&gt; TheCGAM;
+static std::unique_ptr&lt;ModuleAnalysisManager&gt; TheMAM;
+static std::unique_ptr&lt;PassInstrumentationCallbacks&gt; ThePIC;
+static std::unique_ptr&lt;StandardInstrumentations&gt; TheSI;
+static std::map&lt;std::string, std::unique_ptr&lt;PrototypeAST&gt;&gt; FunctionProtos;
+static ExitOnError ExitOnErr;
+
+Value *LogErrorV(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+Function *getFunction(std::string Name) {
+  // First, see if the function has already been added to the current module.
+  if (auto *F = TheModule-&gt;getFunction(Name))
+    return F;
+
+  // If not, check whether we can codegen the declaration from some existing
+  // prototype.
+  auto FI = FunctionProtos.find(Name);
+  if (FI != FunctionProtos.end())
+    return FI-&gt;second-&gt;codegen();
+
+  // If no existing prototype exists, return null.
+  return nullptr;
+}
+
+/// CreateEntryBlockAlloca - Create an alloca instruction in the entry block of
+/// the function.  This is used for mutable variables etc.
+static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction,
+                                          StringRef VarName) {
+  IRBuilder&lt;&gt; TmpB(TheFunction-&gt;getEntryBlock().begin());
+  return TmpB.CreateAlloca(Type::getDoubleTy(*TheContext), nullptr, VarName);
+}
+
+Value *NumberExprAST::codegen() {
+  return ConstantFP::get(*TheContext, APFloat(Val));
+}
+
+Value *VariableExprAST::codegen() {
+  // Look this variable up in the function.
+  AllocaInst *A = NamedValues[Name];
+  if (!A)
+    return LogErrorV(&quot;Unknown variable name&quot;);
+
+  // Load the value.
+  return Builder-&gt;CreateLoad(A-&gt;getAllocatedType(), A, Name.c_str());
+}
+
+Value *UnaryExprAST::codegen() {
+  Value *OperandV = Operand-&gt;codegen();
+  if (!OperandV)
+    return nullptr;
+
+  Function *F = getFunction(std::string(&quot;unary&quot;) + Opcode);
+  if (!F)
+    return LogErrorV(&quot;Unknown unary operator&quot;);
+
+  return Builder-&gt;CreateCall(F, OperandV, &quot;unop&quot;);
+}
+
+Value *BinaryExprAST::codegen() {
+  // Special case &#x27;=&#x27; because we don&#x27;t want to emit the LHS as an expression.
+  if (Op == &#x27;=&#x27;) {
+    // Assignment requires the LHS to be an identifier.
+    // This assume we&#x27;re building without RTTI because LLVM builds that way by
+    // default.  If you build LLVM with RTTI this can be changed to a
+    // dynamic_cast for automatic error checking.
+    VariableExprAST *LHSE = static_cast&lt;VariableExprAST *&gt;(LHS.get());
+    if (!LHSE)
+      return LogErrorV(&quot;destination of &#x27;=&#x27; must be a variable&quot;);
+    // Codegen the RHS.
+    Value *Val = RHS-&gt;codegen();
+    if (!Val)
+      return nullptr;
+
+    // Look up the name.
+    AllocaInst *Alloca = NamedValues[LHSE-&gt;getName()];
+    if (!Alloca)
+      return LogErrorV(&quot;Unknown variable name&quot;);
+
+    Builder-&gt;CreateStore(Val, Alloca);
+    return Val;
+  }
+
+  Value *L = LHS-&gt;codegen();
+  Value *R = RHS-&gt;codegen();
+  if (!L || !R)
+    return nullptr;
+
+  switch (Op) {
+  case &#x27;+&#x27;:
+    return Builder-&gt;CreateFAdd(L, R, &quot;addtmp&quot;);
+  case &#x27;-&#x27;:
+    return Builder-&gt;CreateFSub(L, R, &quot;subtmp&quot;);
+  case &#x27;*&#x27;:
+    return Builder-&gt;CreateFMul(L, R, &quot;multmp&quot;);
+  case &#x27;&lt;&#x27;:
+    L = Builder-&gt;CreateFCmpULT(L, R, &quot;cmptmp&quot;);
+    // Convert bool 0/1 to double 0.0 or 1.0
+    return Builder-&gt;CreateUIToFP(L, Type::getDoubleTy(*TheContext), &quot;booltmp&quot;);
+  default:
+    break;
+  }
+
+  // If it wasn&#x27;t a builtin binary operator, it must be a user defined one. Emit
+  // a call to it.
+  Function *F = getFunction(std::string(&quot;binary&quot;) + Op);
+  assert(F &amp;&amp; &quot;binary operator not found!&quot;);
+
+  Value *Ops[] = {L, R};
+  return Builder-&gt;CreateCall(F, Ops, &quot;binop&quot;);
+}
+
+Value *CallExprAST::codegen() {
+  // Look up the name in the global module table.
+  Function *CalleeF = getFunction(Callee);
+  if (!CalleeF)
+    return LogErrorV(&quot;Unknown function referenced&quot;);
+
+  // If argument mismatch error.
+  if (CalleeF-&gt;arg_size() != Args.size())
+    return LogErrorV(&quot;Incorrect # arguments passed&quot;);
+
+  std::vector&lt;Value *&gt; ArgsV;
+  for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+    ArgsV.push_back(Args[i]-&gt;codegen());
+    if (!ArgsV.back())
+      return nullptr;
+  }
+
+  return Builder-&gt;CreateCall(CalleeF, ArgsV, &quot;calltmp&quot;);
+}
+
+Value *IfExprAST::codegen() {
+  Value *CondV = Cond-&gt;codegen();
+  if (!CondV)
+    return nullptr;
+
+  // Convert condition to a bool by comparing non-equal to 0.0.
+  CondV = Builder-&gt;CreateFCmpONE(
+      CondV, ConstantFP::get(*TheContext, APFloat(0.0)), &quot;ifcond&quot;);
+
+  Function *TheFunction = Builder-&gt;GetInsertBlock()-&gt;getParent();
+
+  // Create blocks for the then and else cases.  Insert the &#x27;then&#x27; block at the
+  // end of the function.
+  BasicBlock *ThenBB = BasicBlock::Create(*TheContext, &quot;then&quot;, TheFunction);
+  BasicBlock *ElseBB = BasicBlock::Create(*TheContext, &quot;else&quot;);
+  BasicBlock *MergeBB = BasicBlock::Create(*TheContext, &quot;ifcont&quot;);
+
+  Builder-&gt;CreateCondBr(CondV, ThenBB, ElseBB);
+
+  // Emit then value.
+  Builder-&gt;SetInsertPoint(ThenBB);
+
+  Value *ThenV = Then-&gt;codegen();
+  if (!ThenV)
+    return nullptr;
+
+  Builder-&gt;CreateBr(MergeBB);
+  // Codegen of &#x27;Then&#x27; can change the current block, update ThenBB for the PHI.
+  ThenBB = Builder-&gt;GetInsertBlock();
+
+  // Emit else block.
+  TheFunction-&gt;insert(TheFunction-&gt;end(), ElseBB);
+  Builder-&gt;SetInsertPoint(ElseBB);
+
+  Value *ElseV = Else-&gt;codegen();
+  if (!ElseV)
+    return nullptr;
+
+  Builder-&gt;CreateBr(MergeBB);
+  // Codegen of &#x27;Else&#x27; can change the current block, update ElseBB for the PHI.
+  ElseBB = Builder-&gt;GetInsertBlock();
+
+  // Emit merge block.
+  TheFunction-&gt;insert(TheFunction-&gt;end(), MergeBB);
+  Builder-&gt;SetInsertPoint(MergeBB);
+  PHINode *PN = Builder-&gt;CreatePHI(Type::getDoubleTy(*TheContext), 2, &quot;iftmp&quot;);
+
+  PN-&gt;addIncoming(ThenV, ThenBB);
+  PN-&gt;addIncoming(ElseV, ElseBB);
+  return PN;
+}
+
+// Output for-loop as:
+//   var = alloca double
+//   ...
+//   start = startexpr
+//   store start -&gt; var
+//   goto loop
+// loop:
+//   ...
+//   bodyexpr
+//   ...
+// loopend:
+//   step = stepexpr
+//   endcond = endexpr
+//
+//   curvar = load var
+//   nextvar = curvar + step
+//   store nextvar -&gt; var
+//   br endcond, loop, endloop
+// outloop:
+Value *ForExprAST::codegen() {
+  Function *TheFunction = Builder-&gt;GetInsertBlock()-&gt;getParent();
+
+  // Create an alloca for the variable in the entry block.
+  AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+
+  // Emit the start code first, without &#x27;variable&#x27; in scope.
+  Value *StartVal = Start-&gt;codegen();
+  if (!StartVal)
+    return nullptr;
+
+  // Store the value into the alloca.
+  Builder-&gt;CreateStore(StartVal, Alloca);
+
+  // Make the new basic block for the loop header, inserting after current
+  // block.
+  BasicBlock *LoopBB = BasicBlock::Create(*TheContext, &quot;loop&quot;, TheFunction);
+
+  // Insert an explicit fall through from the current block to the LoopBB.
+  Builder-&gt;CreateBr(LoopBB);
+
+  // Start insertion in LoopBB.
+  Builder-&gt;SetInsertPoint(LoopBB);
+
+  // Within the loop, the variable is defined equal to the PHI node.  If it
+  // shadows an existing variable, we have to restore it, so save it now.
+  AllocaInst *OldVal = NamedValues[VarName];
+  NamedValues[VarName] = Alloca;
+
+  // Emit the body of the loop.  This, like any other expr, can change the
+  // current BB.  Note that we ignore the value computed by the body, but don&#x27;t
+  // allow an error.
+  if (!Body-&gt;codegen())
+    return nullptr;
+
+  // Emit the step value.
+  Value *StepVal = nullptr;
+  if (Step) {
+    StepVal = Step-&gt;codegen();
+    if (!StepVal)
+      return nullptr;
+  } else {
+    // If not specified, use 1.0.
+    StepVal = ConstantFP::get(*TheContext, APFloat(1.0));
+  }
+
+  // Compute the end condition.
+  Value *EndCond = End-&gt;codegen();
+  if (!EndCond)
+    return nullptr;
+
+  // Reload, increment, and restore the alloca.  This handles the case where
+  // the body of the loop mutates the variable.
+  Value *CurVar =
+      Builder-&gt;CreateLoad(Alloca-&gt;getAllocatedType(), Alloca, VarName.c_str());
+  Value *NextVar = Builder-&gt;CreateFAdd(CurVar, StepVal, &quot;nextvar&quot;);
+  Builder-&gt;CreateStore(NextVar, Alloca);
+
+  // Convert condition to a bool by comparing non-equal to 0.0.
+  EndCond = Builder-&gt;CreateFCmpONE(
+      EndCond, ConstantFP::get(*TheContext, APFloat(0.0)), &quot;loopcond&quot;);
+
+  // Create the &quot;after loop&quot; block and insert it.
+  BasicBlock *AfterBB =
+      BasicBlock::Create(*TheContext, &quot;afterloop&quot;, TheFunction);
+
+  // Insert the conditional branch into the end of LoopEndBB.
+  Builder-&gt;CreateCondBr(EndCond, LoopBB, AfterBB);
+
+  // Any new code will be inserted in AfterBB.
+  Builder-&gt;SetInsertPoint(AfterBB);
+
+  // Restore the unshadowed variable.
+  if (OldVal)
+    NamedValues[VarName] = OldVal;
+  else
+    NamedValues.erase(VarName);
+
+  // for expr always returns 0.0.
+  return Constant::getNullValue(Type::getDoubleTy(*TheContext));
+}
+
+Value *VarExprAST::codegen() {
+  std::vector&lt;AllocaInst *&gt; OldBindings;
+
+  Function *TheFunction = Builder-&gt;GetInsertBlock()-&gt;getParent();
+
+  // Register all variables and emit their initializer.
+  for (unsigned i = 0, e = VarNames.size(); i != e; ++i) {
+    const std::string &amp;VarName = VarNames[i].first;
+    ExprAST *Init = VarNames[i].second.get();
+
+    // Emit the initializer before adding the variable to scope, this prevents
+    // the initializer from referencing the variable itself, and permits stuff
+    // like this:
+    //  var a = 1 in
+    //    var a = a in ...   # refers to outer &#x27;a&#x27;.
+    Value *InitVal;
+    if (Init) {
+      InitVal = Init-&gt;codegen();
+      if (!InitVal)
+        return nullptr;
+    } else { // If not specified, use 0.0.
+      InitVal = ConstantFP::get(*TheContext, APFloat(0.0));
+    }
+
+    AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+    Builder-&gt;CreateStore(InitVal, Alloca);
+
+    // Remember the old variable binding so that we can restore the binding when
+    // we unrecurse.
+    OldBindings.push_back(NamedValues[VarName]);
+
+    // Remember this binding.
+    NamedValues[VarName] = Alloca;
+  }
+
+  // Codegen the body, now that all vars are in scope.
+  Value *BodyVal = Body-&gt;codegen();
+  if (!BodyVal)
+    return nullptr;
+
+  // Pop all our variables from scope.
+  for (unsigned i = 0, e = VarNames.size(); i != e; ++i)
+    NamedValues[VarNames[i].first] = OldBindings[i];
+
+  // Return the body computation.
+  return BodyVal;
+}
+
+Function *PrototypeAST::codegen() {
+  // Make the function type:  double(double,double) etc.
+  std::vector&lt;Type *&gt; Doubles(Args.size(), Type::getDoubleTy(*TheContext));
+  FunctionType *FT =
+      FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false);
+
+  Function *F =
+      Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
+
+  // Set names for all arguments.
+  unsigned Idx = 0;
+  for (auto &amp;Arg : F-&gt;args())
+    Arg.setName(Args[Idx++]);
+
+  return F;
+}
+
+Function *FunctionAST::codegen() {
+  // Transfer ownership of the prototype to the FunctionProtos map, but keep a
+  // reference to it for use below.
+  auto &amp;P = *Proto;
+  FunctionProtos[Proto-&gt;getName()] = std::move(Proto);
+  Function *TheFunction = getFunction(P.getName());
+  if (!TheFunction)
+    return nullptr;
+
+  // If this is an operator, install it.
+  if (P.isBinaryOp())
+    BinopPrecedence[P.getOperatorName()] = P.getBinaryPrecedence();
+
+  // Create a new basic block to start insertion into.
+  BasicBlock *BB = BasicBlock::Create(*TheContext, &quot;entry&quot;, TheFunction);
+  Builder-&gt;SetInsertPoint(BB);
+
+  // Record the function arguments in the NamedValues map.
+  NamedValues.clear();
+  for (auto &amp;Arg : TheFunction-&gt;args()) {
+    // Create an alloca for this variable.
+    AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, Arg.getName());
+
+    // Store the initial value into the alloca.
+    Builder-&gt;CreateStore(&amp;Arg, Alloca);
+
+    // Add arguments to variable symbol table.
+    NamedValues[std::string(Arg.getName())] = Alloca;
+  }
+
+  if (Value *RetVal = Body-&gt;codegen()) {
+    // Finish off the function.
+    Builder-&gt;CreateRet(RetVal);
+
+    // Validate the generated code, checking for consistency.
+    verifyFunction(*TheFunction);
+
+    // Run the optimizer on the function.
+    TheFPM-&gt;run(*TheFunction, *TheFAM);
+
+    return TheFunction;
+  }
+
+  // Error reading body, remove function.
+  TheFunction-&gt;eraseFromParent();
+
+  if (P.isBinaryOp())
+    BinopPrecedence.erase(P.getOperatorName());
+  return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// Top-Level parsing and JIT Driver
+//===----------------------------------------------------------------------===//
+
+static void InitializeModuleAndManagers() {
+  // Open a new context and module.
+  TheContext = std::make_unique&lt;LLVMContext&gt;();
+  TheModule = std::make_unique&lt;Module&gt;(&quot;KaleidoscopeJIT&quot;, *TheContext);
+  TheModule-&gt;setTargetTriple(TheJIT-&gt;getTargetTriple());
+  TheModule-&gt;setDataLayout(TheJIT-&gt;getDataLayout());
+
+  // Create a new builder for the module.
+  Builder = std::make_unique&lt;IRBuilder&lt;&gt;&gt;(*TheModule);
+
+  // Create new pass and analysis managers.
+  TheFPM = std::make_unique&lt;FunctionPassManager&gt;();
+  TheLAM = std::make_unique&lt;LoopAnalysisManager&gt;();
+  TheFAM = std::make_unique&lt;FunctionAnalysisManager&gt;();
+  TheCGAM = std::make_unique&lt;CGSCCAnalysisManager&gt;();
+  TheMAM = std::make_unique&lt;ModuleAnalysisManager&gt;();
+  ThePIC = std::make_unique&lt;PassInstrumentationCallbacks&gt;();
+  TheSI = std::make_unique&lt;StandardInstrumentations&gt;(*TheContext,
+                                                     /*DebugLogging*/ true);
+  TheSI-&gt;registerCallbacks(*ThePIC, TheMAM.get());
+
+  // Add transform passes.
+  // Promote allocas to registers.
+  TheFPM-&gt;addPass(PromotePass());
+  // Do simple &quot;peephole&quot; optimizations and bit-twiddling optzns.
+  TheFPM-&gt;addPass(InstCombinePass());
+  // Reassociate expressions.
+  TheFPM-&gt;addPass(ReassociatePass());
+  // Eliminate Common SubExpressions.
+  TheFPM-&gt;addPass(GVNPass());
+  // Simplify the control flow graph (deleting unreachable blocks, etc).
+  TheFPM-&gt;addPass(SimplifyCFGPass());
+
+  // Register analysis passes used in these transform passes.
+  PassBuilder PB(*TheContext);
+  PB.registerModuleAnalyses(*TheMAM);
+  PB.registerFunctionAnalyses(*TheFAM);
+  PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
+}
+
+static void HandleDefinition() {
+  if (auto FnAST = ParseDefinition()) {
+    if (auto *FnIR = FnAST-&gt;codegen()) {
+      fprintf(stderr, &quot;Read function definition:&quot;);
+      FnIR-&gt;print(errs());
+      fprintf(stderr, &quot;\n&quot;);
+      ExitOnErr(TheJIT-&gt;addModule(
+          ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
+      InitializeModuleAndManagers();
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+static void HandleExtern() {
+  if (auto ProtoAST = ParseExtern()) {
+    if (auto *FnIR = ProtoAST-&gt;codegen()) {
+      fprintf(stderr, &quot;Read extern: &quot;);
+      FnIR-&gt;print(errs());
+      fprintf(stderr, &quot;\n&quot;);
+      FunctionProtos[ProtoAST-&gt;getName()] = std::move(ProtoAST);
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+static void HandleTopLevelExpression() {
+  // Evaluate a top-level expression into an anonymous function.
+  if (auto FnAST = ParseTopLevelExpr()) {
+    if (FnAST-&gt;codegen()) {
+      // Create a ResourceTracker to track JIT&#x27;d memory allocated to our
+      // anonymous expression -- that way we can free it after executing.
+      auto RT = TheJIT-&gt;getMainJITDylib().createResourceTracker();
+
+      auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+      ExitOnErr(TheJIT-&gt;addModule(std::move(TSM), RT));
+      InitializeModuleAndManagers();
+
+      // Search the JIT for the __anon_expr symbol.
+      auto ExprSymbol = ExitOnErr(TheJIT-&gt;lookup(&quot;__anon_expr&quot;));
+
+      // Get the symbol&#x27;s address and cast it to the right type (takes no
+      // arguments, returns a double) so we can call it as a native function.
+      double (*FP)() = ExprSymbol.toPtr&lt;double (*)()&gt;();
+      fprintf(stderr, &quot;Evaluated to %f\n&quot;, FP());
+
+      // Delete the anonymous expression module from the JIT.
+      ExitOnErr(RT-&gt;remove());
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+/// top ::= definition | external | expression | &#x27;;&#x27;
+static void MainLoop() {
+  while (true) {
+    fprintf(stderr, &quot;ready&gt; &quot;);
+    switch (CurTok) {
+    case tok_eof:
+      return;
+    case &#x27;;&#x27;: // ignore top-level semicolons.
+      getNextToken();
+      break;
+    case tok_def:
+      HandleDefinition();
+      break;
+    case tok_extern:
+      HandleExtern();
+      break;
+    default:
+      HandleTopLevelExpression();
+      break;
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// &quot;Library&quot; functions that can be &quot;extern&#x27;d&quot; from user code.
+//===----------------------------------------------------------------------===//
+
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+/// putchard - putchar that takes a double and returns 0.
+extern &quot;C&quot; DLLEXPORT double putchard(double X) {
+  fputc((char)X, stderr);
+  return 0;
+}
+
+/// printd - printf that takes a double prints it as &quot;%f\n&quot;, returning 0.
+extern &quot;C&quot; DLLEXPORT double printd(double X) {
+  fprintf(stderr, &quot;%f\n&quot;, X);
+  return 0;
+}
+
+//===----------------------------------------------------------------------===//
+// Main driver code.
+//===----------------------------------------------------------------------===//
+
+int main() {
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+
+  // Install standard binary operators.
+  // 1 is lowest precedence.
+  BinopPrecedence[&#x27;=&#x27;] = 2;
+  BinopPrecedence[&#x27;&lt;&#x27;] = 10;
+  BinopPrecedence[&#x27;+&#x27;] = 20;
+  BinopPrecedence[&#x27;-&#x27;] = 20;
+  BinopPrecedence[&#x27;*&#x27;] = 40; // highest.
+
+  // Prime the first token.
+  fprintf(stderr, &quot;ready&gt; &quot;);
+  getNextToken();
+
+  TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
+
+  InitializeModuleAndManagers();
+
+  // Run the main &quot;interpreter loop&quot; now.
+  MainLoop();
+
+  return 0;
+}
+</code></pre>
+<p>下一章：编译为目标文件</p><h2 id="references">原文参考链接</h2><ul><li><a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/index.html">Implementing a language with LLVM</a></li><li><a href="http://en.wikipedia.org/wiki/Functional_programming">functional programming language</a></li><li><a href="http://en.wikipedia.org/wiki/Static_single_assignment_form">online references</a></li><li><a href="https://llvm.org/docs/WritingAnLLVMPass.html">Analysis Passes</a></li><li><a href="https://llvm.org/docs/LangRef.html#alloca-instruction">LLVM alloca instruction</a></li><li><a href="https://llvm.org/docs/LangRef.html#first-class-types">first class</a></li><li><a href="https://llvm.org/docs/SourceLevelDebugging.html">Debug information in LLVM</a></li><li><a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl07.html#full-code-listing">full code listing</a></li><li><a href="Kaleidoscope_Chapter5.html#code-generation-for-the-for-loop">before we allowed mutable variables</a></li><li><a href="Kaleidoscope_Chapter8.html">Next: Compiling to Object Code</a></li></ul><footer>原文与示例代码版权归 LLVM Project 及其贡献者；许可及最新内容见 <a href="https://llvm.org/docs/">LLVM 官方文档</a>。中文翻译中标注的“译注”用于补充版本和语义说明。</footer></body></html>

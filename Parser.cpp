@@ -1,6 +1,5 @@
 #include "Parser.h"
 #include "token.h"
-#include "header.h"
 
 #include <cstdio>
 #include <map>
@@ -27,11 +26,6 @@ std::unique_ptr<ExprAST> LogError(const char *message) {
 std::unique_ptr<PrototypeAST> LogErrorP(const char *message) {
     LogError(message);
     return nullptr;
-}
-
-Value *LogErrorV(const char *Str) {
-  LogError(Str);
-  return nullptr;
 }
 
 int GetTokPrecedence() {

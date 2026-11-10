@@ -1,0 +1,1672 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LLVM Kaleidoscope 第 6 章：用户自定义运算符（中文翻译）</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;line-height:1.85;color:#242a35;background:#fff;max-width:920px;margin:0 auto;padding:42px 25px}h1{font-size:2rem;line-height:1.4;margin-bottom:8px}h2{font-size:1.5rem;border-bottom:1px solid #dae0e6;padding:24px 0 10px;margin-top:38px}p{margin:17px 0;font-size:16px}pre{background:#f4f6f9;border:1px solid #e1e6eb;border-radius:0 0 9px 9px;padding:17px;overflow:auto;line-height:1.5;font-size:13px;tab-size:2;margin-top:0}code{font-family:Consolas,"DejaVu Sans Mono",monospace}.code-title{background:#e9edf3;border-radius:9px 9px 0 0;padding:4px 14px;font-size:12px;color:#526174;margin-top:20px}nav{display:flex;flex-wrap:wrap;gap:10px;margin:24px 0;padding:18px;background:#f5f7fa;border-radius:10px}nav a{color:#1656a5;text-decoration:none;font-size:14px}blockquote{border-left:3px solid #888;padding-left:15px}.note{color:#546170;font-size:14px}a{color:#1656a5}@media print{body{padding:0}pre{white-space:pre-wrap;word-wrap:break-word}section{break-inside:auto}}h3{margin-top:30px}img{max-width:100%;height:auto}footer{border-top:1px solid #dae0e6;margin-top:40px;padding-top:15px;font-size:13px;color:#546170}li{margin:8px 0}</style></head><body><h1 id="kaleidoscope-extending-the-language-user-defined-operators">第六章：Kaleidoscope——扩展语言：用户自定义运算符</h1><p class="note">根据 <a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl06.html">LLVM 官方第 6 章</a>翻译（原文获取日期：2026-11-10）。正文与各节说明译为中文；C++、LLVM IR、命令及输出完整保留原文。版式参考本项目第 3 章。原文可能使用比本项目 LLVM 18 更新的 API，应配合所安装版本的教程阅读；本页代码不是当前主程序已实现功能的声明。</p><nav aria-label="章节导航"><a href="index.html">目录</a><a href="Kaleidoscope_Chapter3.html">第 3 章：生成 LLVM IR</a><a href="Kaleidoscope_Chapter4.html">第 4 章：添加 JIT 和优化器支持</a><a href="Kaleidoscope_Chapter5.html">第 5 章：控制流</a><a href="Kaleidoscope_Chapter7.html">第 7 章：可变变量</a><a href="Kaleidoscope_Chapter8.html">第 8 章：编译为目标文件</a><a href="Kaleidoscope_Chapter9.html">第 9 章：添加调试信息</a><a href="Kaleidoscope_Chapter10.html">第 10 章：总结与实用知识</a></nav><nav aria-label="本章目录"><a href="#chapter-6-introduction">6.1 第六章简介</a><a href="#user-defined-operators-the-idea">6.2 用户自定义运算符：基本思路</a><a href="#user-defined-binary-operators">6.3 用户自定义二元运算符</a><a href="#user-defined-unary-operators">6.4 用户自定义一元运算符</a><a href="#kicking-the-tires">6.5 动手试用</a><a href="#full-code-listing">6.6 完整代码清单</a></nav><h2 id="chapter-6-introduction">6.1 第六章简介</h2>
+<p>欢迎来到《使用 LLVM 实现一门语言》第六章。现在已有一门功能完整、规模很小但可用的语言。不过，它仍缺少许多实用运算符，例如除法、逻辑非，以及小于之外的比较运算。</p>
+<p>本章将探索为 Kaleidoscope 加入用户自定义运算符。这可能让原本简单优美的语言在某些方面显得不那么整齐，却也使它更强大。创造语言的乐趣之一，就是可以自行决定什么设计合适；这里借此展示一些有趣的解析技术。</p>
+<p>本章最后将用 Kaleidoscope 编写一个绘制 Mandelbrot 集的程序，展示现有功能能够实现什么。</p>
+<h2 id="user-defined-operators-the-idea">6.2 用户自定义运算符：基本思路</h2>
+<p>我们加入的“运算符重载”比 C++ 等语言更一般。C++ 只能重定义已有运算符，不能通过程序改变语法、引入新运算符或改变优先级。本章让 Kaleidoscope 支持这些能力，由用户补充语言的运算符集合。</p>
+<p>这里引入用户自定义运算符，是为了展示手写解析器的灵活性。此前大部分语法使用递归下降，表达式使用运算符优先级解析，详见第二章。采用优先级解析后，用户很容易向语法中引入新运算符；语法可以随着 JIT 运行动态扩展。</p>
+<p>具体加入两项功能：可编程的一元运算符和二元运算符。当前语言尚无一元运算符。示例如下：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code># Logical unary not.
+def unary!(v)
+  if v then
+    0
+  else
+    1;
+
+# Define &gt; with the same precedence as &lt;.
+def binary&gt; 10 (LHS RHS)
+  RHS &lt; LHS;
+
+# Binary &quot;logical or&quot;, (note that it does not &quot;short circuit&quot;)
+def binary| 5 (LHS RHS)
+  if LHS then
+    1
+  else if RHS then
+    1
+  else
+    0;
+
+# Define = with slightly lower precedence than relationals.
+def binary= 9 (LHS RHS)
+  !(LHS &lt; RHS | LHS &gt; RHS);
+</code></pre>
+<p>许多语言希望用自身实现标准运行库；在 Kaleidoscope 中，甚至可以在库中实现语言本身的重要组成部分！</p>
+<p>实现分为两步：先支持用户自定义二元运算符，再添加一元运算符。</p>
+<h2 id="user-defined-binary-operators">6.3 用户自定义二元运算符</h2>
+<p>依托现有框架，二元运算符很容易扩展。首先支持 unary 和 binary 关键字：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>enum Token {
+  ...
+  // operators
+  tok_binary = -11,
+  tok_unary = -12
+};
+...
+static int gettok() {
+...
+    if (IdentifierStr == &quot;for&quot;)
+      return tok_for;
+    if (IdentifierStr == &quot;in&quot;)
+      return tok_in;
+    if (IdentifierStr == &quot;binary&quot;)
+      return tok_binary;
+    if (IdentifierStr == &quot;unary&quot;)
+      return tok_unary;
+    return tok_identifier;
+</code></pre>
+<p>词法分析器增加关键字的方式与之前一致。现有二元运算 AST 使用字符的 ASCII 编码表示操作，因此已经足够通用；扩展运算符可以沿用它，不必为二元表达式新增节点或解析机制。</p>
+<p>但还需要表示运算符的定义，例如函数定义中的“def binary| 5”。此前函数名与参数由 prototype 规则解析为 PrototypeAST；为了表示自定义运算符，要扩展这个节点：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>/// PrototypeAST - This class represents the &quot;prototype&quot; for a function,
+/// which captures its argument names as well as if it is an operator.
+class PrototypeAST {
+  std::string Name;
+  std::vector&lt;std::string&gt; Args;
+  bool IsOperator;
+  unsigned Precedence;  // Precedence if a binary op.
+
+public:
+  PrototypeAST(const std::string &amp;Name, std::vector&lt;std::string&gt; Args,
+               bool IsOperator = false, unsigned Prec = 0)
+  : Name(Name), Args(std::move(Args)), IsOperator(IsOperator),
+    Precedence(Prec) {}
+
+  Function *codegen();
+  const std::string &amp;getName() const { return Name; }
+
+  bool isUnaryOp() const { return IsOperator &amp;&amp; Args.size() == 1; }
+  bool isBinaryOp() const { return IsOperator &amp;&amp; Args.size() == 2; }
+
+  char getOperatorName() const {
+    assert(isUnaryOp() || isBinaryOp());
+    return Name[Name.size() - 1];
+  }
+
+  unsigned getBinaryPrecedence() const { return Precedence; }
+};
+</code></pre>
+<p>除了原型名称，现在还记录它是否为运算符，以及运算符的优先级。优先级只用于二元运算符，一元运算符无需该信息。有了表示方式，再添加原型解析：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>/// prototype
+///   ::= id &#x27;(&#x27; id* &#x27;)&#x27;
+///   ::= binary LETTER number? (id, id)
+static std::unique_ptr&lt;PrototypeAST&gt; ParsePrototype() {
+  std::string FnName;
+
+  unsigned Kind = 0;  // 0 = identifier, 1 = unary, 2 = binary.
+  unsigned BinaryPrecedence = 30;
+
+  switch (CurTok) {
+  default:
+    return LogErrorP(&quot;Expected function name in prototype&quot;);
+  case tok_identifier:
+    FnName = IdentifierStr;
+    Kind = 0;
+    getNextToken();
+    break;
+  case tok_binary:
+    getNextToken();
+    if (!isascii(CurTok))
+      return LogErrorP(&quot;Expected binary operator&quot;);
+    FnName = &quot;binary&quot;;
+    FnName += (char)CurTok;
+    Kind = 2;
+    getNextToken();
+
+    // Read the precedence if present.
+    if (CurTok == tok_number) {
+      if (NumVal &lt; 1 || NumVal &gt; 100)
+        return LogErrorP(&quot;Invalid precedence: must be 1..100&quot;);
+      BinaryPrecedence = (unsigned)NumVal;
+      getNextToken();
+    }
+    break;
+  }
+
+  if (CurTok != &#x27;(&#x27;)
+    return LogErrorP(&quot;Expected &#x27;(&#x27; in prototype&quot;);
+
+  std::vector&lt;std::string&gt; ArgNames;
+  while (getNextToken() == tok_identifier)
+    ArgNames.push_back(IdentifierStr);
+  if (CurTok != &#x27;)&#x27;)
+    return LogErrorP(&quot;Expected &#x27;)&#x27; in prototype&quot;);
+
+  // success.
+  getNextToken();  // eat &#x27;)&#x27;.
+
+  // Verify right number of names for operator.
+  if (Kind &amp;&amp; ArgNames.size() != Kind)
+    return LogErrorP(&quot;Invalid number of operands for operator&quot;);
+
+  return std::make_unique&lt;PrototypeAST&gt;(FnName, std::move(ArgNames), Kind != 0,
+                                         BinaryPrecedence);
+}
+</code></pre>
+<p>大部分逻辑与之前类似。值得注意的是二元运算符的 FnName：例如 @ 会被命名为 binary@。LLVM 符号表允许名称包含任意字符，甚至嵌入空字符，因此这种命名方式可直接使用。</p>
+<p>随后补充代码生成：只需扩展现有二元运算节点的 default 分支：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>Value *BinaryExprAST::codegen() {
+  Value *L = LHS-&gt;codegen();
+  Value *R = RHS-&gt;codegen();
+  if (!L || !R)
+    return nullptr;
+
+  switch (Op) {
+  case &#x27;+&#x27;:
+    return Builder-&gt;CreateFAdd(L, R, &quot;addtmp&quot;);
+  case &#x27;-&#x27;:
+    return Builder-&gt;CreateFSub(L, R, &quot;subtmp&quot;);
+  case &#x27;*&#x27;:
+    return Builder-&gt;CreateFMul(L, R, &quot;multmp&quot;);
+  case &#x27;&lt;&#x27;:
+    L = Builder-&gt;CreateFCmpULT(L, R, &quot;cmptmp&quot;);
+    // Convert bool 0/1 to double 0.0 or 1.0
+    return Builder-&gt;CreateUIToFP(L, Type::getDoubleTy(*TheContext),
+                                &quot;booltmp&quot;);
+  default:
+    break;
+  }
+
+  // If it wasn&#x27;t a builtin binary operator, it must be a user defined one. Emit
+  // a call to it.
+  Function *F = getFunction(std::string(&quot;binary&quot;) + Op);
+  assert(F &amp;&amp; &quot;binary operator not found!&quot;);
+
+  Value *Ops[2] = { L, R };
+  return Builder-&gt;CreateCall(F, Ops, &quot;binop&quot;);
+}
+</code></pre>
+<p>新增代码在符号表中查找相应运算符，并生成函数调用。自定义运算符的原型最终就是一个具有特殊名称的普通函数，所以可以直接复用函数机制。</p>
+<p>最后还需要一点顶层处理：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>Function *FunctionAST::codegen() {
+  // Transfer ownership of the prototype to the FunctionProtos map, but keep a
+  // reference to it for use below.
+  auto &amp;P = *Proto;
+  FunctionProtos[Proto-&gt;getName()] = std::move(Proto);
+  Function *TheFunction = getFunction(P.getName());
+  if (!TheFunction)
+    return nullptr;
+
+  // If this is an operator, install it.
+  if (P.isBinaryOp())
+    BinopPrecedence[P.getOperatorName()] = P.getBinaryPrecedence();
+
+  // Create a new basic block to start insertion into.
+  BasicBlock *BB = BasicBlock::Create(*TheContext, &quot;entry&quot;, TheFunction);
+  ...
+</code></pre>
+<p>生成函数代码之前，如果它是用户自定义二元运算符，就把它注册到优先级表。现有的通用优先级解析器随后就能识别它，这样便完成了语法扩展。</p>
+<p>至此，用户自定义二元运算符已经可用，主要复用了此前的框架。一元运算符还没有任何基础支持，接下来看看需要添加什么。</p>
+<h2 id="user-defined-unary-operators">6.4 用户自定义一元运算符</h2>
+<p>目前 Kaleidoscope 不支持一元运算，因此需要补齐各个环节。词法分析器已经加入 unary 关键字，接下来创建 AST 节点：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>/// UnaryExprAST - Expression class for a unary operator.
+class UnaryExprAST : public ExprAST {
+  char Opcode;
+  std::unique_ptr&lt;ExprAST&gt; Operand;
+
+public:
+  UnaryExprAST(char Opcode, std::unique_ptr&lt;ExprAST&gt; Operand)
+    : Opcode(Opcode), Operand(std::move(Operand)) {}
+
+  Value *codegen() override;
+};
+</code></pre>
+<p>它与二元运算节点非常相似，只是只有一个子节点。然后添加解析函数：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>/// unary
+///   ::= primary
+///   ::= &#x27;!&#x27; unary
+static std::unique_ptr&lt;ExprAST&gt; ParseUnary() {
+  // If the current token is not an operator, it must be a primary expr.
+  if (!isascii(CurTok) || CurTok == &#x27;(&#x27; || CurTok == &#x27;,&#x27;)
+    return ParsePrimary();
+
+  // If this is a unary operator, read it.
+  int Opc = CurTok;
+  getNextToken();
+  if (auto Operand = ParseUnary())
+    return std::make_unique&lt;UnaryExprAST&gt;(Opc, std::move(Operand));
+  return nullptr;
+}
+</code></pre>
+<p>语法很直接：遇到前缀运算符时消费它，并递归解析后面的另一个一元表达式。这样可以处理 !!x 等连续前缀。它们不会像二元运算那样产生结合顺序歧义，所以无需优先级信息。</p>
+<p>还需要把 ParseUnary 接入解析流程：将此前调用 ParsePrimary 的相关位置改为调用 ParseUnary：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>/// binoprhs
+///   ::= (&#x27;+&#x27; unary)*
+static std::unique_ptr&lt;ExprAST&gt; ParseBinOpRHS(int ExprPrec,
+                                              std::unique_ptr&lt;ExprAST&gt; LHS) {
+  ...
+    // Parse the unary expression after the binary operator.
+    auto RHS = ParseUnary();
+    if (!RHS)
+      return nullptr;
+  ...
+}
+/// expression
+///   ::= unary binoprhs
+///
+static std::unique_ptr&lt;ExprAST&gt; ParseExpression() {
+  auto LHS = ParseUnary();
+  if (!LHS)
+    return nullptr;
+
+  return ParseBinOpRHS(0, std::move(LHS));
+}
+</code></pre>
+<p>完成这两处修改后，就能解析一元运算并构建 AST。接下来扩展原型解析，使其支持一元运算符定义：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>/// prototype
+///   ::= id &#x27;(&#x27; id* &#x27;)&#x27;
+///   ::= binary LETTER number? (id, id)
+///   ::= unary LETTER (id)
+static std::unique_ptr&lt;PrototypeAST&gt; ParsePrototype() {
+  std::string FnName;
+
+  unsigned Kind = 0;  // 0 = identifier, 1 = unary, 2 = binary.
+  unsigned BinaryPrecedence = 30;
+
+  switch (CurTok) {
+  default:
+    return LogErrorP(&quot;Expected function name in prototype&quot;);
+  case tok_identifier:
+    FnName = IdentifierStr;
+    Kind = 0;
+    getNextToken();
+    break;
+  case tok_unary:
+    getNextToken();
+    if (!isascii(CurTok))
+      return LogErrorP(&quot;Expected unary operator&quot;);
+    FnName = &quot;unary&quot;;
+    FnName += (char)CurTok;
+    Kind = 1;
+    getNextToken();
+    break;
+  case tok_binary:
+    ...
+</code></pre>
+<p>与二元运算一样，一元运算符的函数名包含运算符字符，以便生成代码时查找。最后实现一元运算的代码生成：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>Value *UnaryExprAST::codegen() {
+  Value *OperandV = Operand-&gt;codegen();
+  if (!OperandV)
+    return nullptr;
+
+  Function *F = getFunction(std::string(&quot;unary&quot;) + Opcode);
+  if (!F)
+    return LogErrorV(&quot;Unknown unary operator&quot;);
+
+  return Builder-&gt;CreateCall(F, OperandV, &quot;unop&quot;);
+}
+</code></pre>
+<p>它与二元运算代码类似，但更简单，因为不必处理预定义运算符。</p>
+<h2 id="kicking-the-tires">6.5 动手试用</h2>
+<p>经过前几章的少量扩展，我们已经有了一门像样的语言，可以完成 I/O、数学计算等任务。例如，可以定义顺序求值运算符；这里的 printd 用于打印一个数值并换行：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>ready&gt; extern printd(x);
+Read extern:
+declare double @printd(double)
+
+ready&gt; def binary : 1 (x y) 0;  # Low-precedence operator that ignores operands.
+...
+ready&gt; printd(123) : printd(456) : printd(789);
+123.000000
+456.000000
+789.000000
+Evaluated to 0.000000
+</code></pre>
+<p>还可以定义其他“基本”操作：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code># Logical unary not.
+def unary!(v)
+  if v then
+    0
+  else
+    1;
+
+# Unary negate.
+def unary-(v)
+  0-v;
+
+# Define &gt; with the same precedence as &lt;.
+def binary&gt; 10 (LHS RHS)
+  RHS &lt; LHS;
+
+# Binary logical or, which does not short circuit.
+def binary| 5 (LHS RHS)
+  if LHS then
+    1
+  else if RHS then
+    1
+  else
+    0;
+
+# Binary logical and, which does not short circuit.
+def binary&amp; 6 (LHS RHS)
+  if !LHS then
+    0
+  else
+    !!RHS;
+
+# Define = with slightly lower precedence than relationals.
+def binary = 9 (LHS RHS)
+  !(LHS &lt; RHS | LHS &gt; RHS);
+
+# Define &#x27;:&#x27; for sequencing: as a low-precedence operator that ignores operands
+# and just returns the RHS.
+def binary : 1 (x y) y;
+</code></pre>
+<p>借助之前的 if/then/else，还能编写有趣的输出函数。例如根据输入数值选择字符，数值越小，字符看起来越密：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>ready&gt; extern putchard(char);
+...
+ready&gt; def printdensity(d)
+  if d &gt; 8 then
+    putchard(32)  # &#x27; &#x27;
+  else if d &gt; 4 then
+    putchard(46)  # &#x27;.&#x27;
+  else if d &gt; 2 then
+    putchard(43)  # &#x27;+&#x27;
+  else
+    putchard(42); # &#x27;*&#x27;
+...
+ready&gt; printdensity(1): printdensity(2): printdensity(3):
+       printdensity(4): printdensity(5): printdensity(9):
+       putchard(10);
+**++.
+Evaluated to 0.000000
+</code></pre>
+<p>基于这些简单操作，可以构造更复杂的功能。下面的函数计算复平面上某个迭代过程发散所需的次数：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code># Determine whether the specific location diverges.
+# Solve for z = z^2 + c in the complex plane.
+def mandelconverger(real imag iters creal cimag)
+  if iters &gt; 255 | (real*real + imag*imag &gt; 4) then
+    iters
+  else
+    mandelconverger(real*real - imag*imag + creal,
+                    2*real*imag + cimag,
+                    iters+1, creal, cimag);
+
+# Return the number of iterations required for the iteration to escape
+def mandelconverge(real imag)
+  mandelconverger(real, imag, 0, real, imag);
+</code></pre>
+<p>“z = z² + c”是 Mandelbrot 集计算的基础。mandelconverge 返回复数轨道逃逸所需的迭代次数，上限为 255。单独看这个函数用处有限，但把结果画到二维平面，就能看到 Mandelbrot 集。这里仅能使用 putchard，所以图形输出受到限制；不过，可以结合前面的字符密度函数绘图：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code># Compute and plot the mandelbrot set with the specified 2 dimensional range
+# info.
+def mandelhelp(xmin xmax xstep   ymin ymax ystep)
+  for y = ymin, y &lt; ymax, ystep in (
+    (for x = xmin, x &lt; xmax, xstep in
+       printdensity(mandelconverge(x,y)))
+    : putchard(10)
+  )
+
+# mandel - This is a convenient helper function for plotting the mandelbrot set
+# from the specified position with the specified Magnification.
+def mandel(realstart imagstart realmag imagmag)
+  mandelhelp(realstart, realstart+realmag*78, realmag,
+             imagstart, imagstart+imagmag*40, imagmag);
+</code></pre>
+<p>现在尝试绘制 Mandelbrot 集：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>ready&gt; mandel(-2.3, -1.3, 0.05, 0.07);
+*******************************+++++++++++*************************************
+*************************+++++++++++++++++++++++*******************************
+**********************+++++++++++++++++++++++++++++****************************
+*******************+++++++++++++++++++++.. ...++++++++*************************
+*****************++++++++++++++++++++++.... ...+++++++++***********************
+***************+++++++++++++++++++++++.....   ...+++++++++*********************
+**************+++++++++++++++++++++++....     ....+++++++++********************
+*************++++++++++++++++++++++......      .....++++++++*******************
+************+++++++++++++++++++++.......       .......+++++++******************
+***********+++++++++++++++++++....                ... .+++++++*****************
+**********+++++++++++++++++.......                     .+++++++****************
+*********++++++++++++++...........                    ...+++++++***************
+********++++++++++++............                      ...++++++++**************
+********++++++++++... ..........                        .++++++++**************
+*******+++++++++.....                                   .+++++++++*************
+*******++++++++......                                  ..+++++++++*************
+*******++++++.......                                   ..+++++++++*************
+*******+++++......                                     ..+++++++++*************
+*******.... ....                                      ...+++++++++*************
+*******.... .                                         ...+++++++++*************
+*******+++++......                                    ...+++++++++*************
+*******++++++.......                                   ..+++++++++*************
+*******++++++++......                                   .+++++++++*************
+*******+++++++++.....                                  ..+++++++++*************
+********++++++++++... ..........                        .++++++++**************
+********++++++++++++............                      ...++++++++**************
+*********++++++++++++++..........                     ...+++++++***************
+**********++++++++++++++++........                     .+++++++****************
+**********++++++++++++++++++++....                ... ..+++++++****************
+***********++++++++++++++++++++++.......       .......++++++++*****************
+************+++++++++++++++++++++++......      ......++++++++******************
+**************+++++++++++++++++++++++....      ....++++++++********************
+***************+++++++++++++++++++++++.....   ...+++++++++*********************
+*****************++++++++++++++++++++++....  ...++++++++***********************
+*******************+++++++++++++++++++++......++++++++*************************
+*********************++++++++++++++++++++++.++++++++***************************
+*************************+++++++++++++++++++++++*******************************
+******************************+++++++++++++************************************
+*******************************************************************************
+*******************************************************************************
+*******************************************************************************
+Evaluated to 0.000000
+ready&gt; mandel(-2, -1, 0.02, 0.04);
+**************************+++++++++++++++++++++++++++++++++++++++++++++++++++++
+***********************++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+*********************+++++++++++++++++++++++++++++++++++++++++++++++++++++++++.
+*******************+++++++++++++++++++++++++++++++++++++++++++++++++++++++++...
+*****************+++++++++++++++++++++++++++++++++++++++++++++++++++++++++.....
+***************++++++++++++++++++++++++++++++++++++++++++++++++++++++++........
+**************++++++++++++++++++++++++++++++++++++++++++++++++++++++...........
+************+++++++++++++++++++++++++++++++++++++++++++++++++++++..............
+***********++++++++++++++++++++++++++++++++++++++++++++++++++........        .
+**********++++++++++++++++++++++++++++++++++++++++++++++.............
+********+++++++++++++++++++++++++++++++++++++++++++..................
+*******+++++++++++++++++++++++++++++++++++++++.......................
+******+++++++++++++++++++++++++++++++++++...........................
+*****++++++++++++++++++++++++++++++++............................
+*****++++++++++++++++++++++++++++...............................
+****++++++++++++++++++++++++++......   .........................
+***++++++++++++++++++++++++.........     ......    ...........
+***++++++++++++++++++++++............
+**+++++++++++++++++++++..............
+**+++++++++++++++++++................
+*++++++++++++++++++.................
+*++++++++++++++++............ ...
+*++++++++++++++..............
+*+++....++++................
+*..........  ...........
+*
+*..........  ...........
+*+++....++++................
+*++++++++++++++..............
+*++++++++++++++++............ ...
+*++++++++++++++++++.................
+**+++++++++++++++++++................
+**+++++++++++++++++++++..............
+***++++++++++++++++++++++............
+***++++++++++++++++++++++++.........     ......    ...........
+****++++++++++++++++++++++++++......   .........................
+*****++++++++++++++++++++++++++++...............................
+*****++++++++++++++++++++++++++++++++............................
+******+++++++++++++++++++++++++++++++++++...........................
+*******+++++++++++++++++++++++++++++++++++++++.......................
+********+++++++++++++++++++++++++++++++++++++++++++..................
+Evaluated to 0.000000
+ready&gt; mandel(-0.9, -1.4, 0.02, 0.03);
+*******************************************************************************
+*******************************************************************************
+*******************************************************************************
+**********+++++++++++++++++++++************************************************
+*+++++++++++++++++++++++++++++++++++++++***************************************
++++++++++++++++++++++++++++++++++++++++++++++**********************************
+++++++++++++++++++++++++++++++++++++++++++++++++++*****************************
+++++++++++++++++++++++++++++++++++++++++++++++++++++++*************************
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++**********************
++++++++++++++++++++++++++++++++++.........++++++++++++++++++*******************
++++++++++++++++++++++++++++++++....   ......+++++++++++++++++++****************
++++++++++++++++++++++++++++++.......  ........+++++++++++++++++++**************
+++++++++++++++++++++++++++++........   ........++++++++++++++++++++************
++++++++++++++++++++++++++++.........     ..  ...+++++++++++++++++++++**********
+++++++++++++++++++++++++++...........        ....++++++++++++++++++++++********
+++++++++++++++++++++++++.............       .......++++++++++++++++++++++******
++++++++++++++++++++++++.............        ........+++++++++++++++++++++++****
+++++++++++++++++++++++...........           ..........++++++++++++++++++++++***
+++++++++++++++++++++...........                .........++++++++++++++++++++++*
+++++++++++++++++++............                  ...........++++++++++++++++++++
+++++++++++++++++...............                 .............++++++++++++++++++
+++++++++++++++.................                 ...............++++++++++++++++
+++++++++++++..................                  .................++++++++++++++
++++++++++..................                      .................+++++++++++++
+++++++........        .                               .........  ..++++++++++++
+++............                                         ......    ....++++++++++
+..............                                                    ...++++++++++
+..............                                                    ....+++++++++
+..............                                                    .....++++++++
+.............                                                    ......++++++++
+...........                                                     .......++++++++
+.........                                                       ........+++++++
+.........                                                       ........+++++++
+.........                                                           ....+++++++
+........                                                             ...+++++++
+.......                                                              ...+++++++
+                                                                    ....+++++++
+                                                                   .....+++++++
+                                                                    ....+++++++
+                                                                    ....+++++++
+                                                                    ....+++++++
+Evaluated to 0.000000
+ready&gt; ^D
+</code></pre>
+<p>到这里可以看到，Kaleidoscope 已经是一门真正有表达能力的语言。它本身未必自相似，却可以画出自相似的图案！</p>
+<p>本章完成了用户自定义运算符，让库可以扩展语言，并用这些能力编写了一个简单而有趣的应用。当前语言支持函数式计算，也能调用有副作用的函数，但还不能自行定义和修改变量。</p>
+<p>可变变量是许多语言的重要能力。然而，如何支持它而不在前端增加 SSA 构造阶段，并不直观。下一章将介绍相应方法。</p>
+<h2 id="full-code-listing">6.6 完整代码清单</h2>
+<p>下面是加入用户自定义运算符后的完整示例。编译方式如下：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code># Compile
+clang++ -g toy.cpp `llvm-config --cxxflags --ldflags --system-libs --libs core orcjit native` -O3 -o toy
+# Run
+./toy
+</code></pre>
+<p>某些平台链接时需要指定 -rdynamic 或 -Wl,--export-dynamic，确保主可执行文件中的符号导出给动态链接器，供运行时解析。若辅助代码编译为共享库则不需要，不过在 Windows 上这样做还会遇到问题。</p>
+<p>完整代码如下：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>#include &quot;../include/KaleidoscopeJIT.h&quot;
+#include &quot;llvm/ADT/APFloat.h&quot;
+#include &quot;llvm/ADT/STLExtras.h&quot;
+#include &quot;llvm/IR/BasicBlock.h&quot;
+#include &quot;llvm/IR/Constants.h&quot;
+#include &quot;llvm/IR/DerivedTypes.h&quot;
+#include &quot;llvm/IR/Function.h&quot;
+#include &quot;llvm/IR/IRBuilder.h&quot;
+#include &quot;llvm/IR/Instructions.h&quot;
+#include &quot;llvm/IR/LLVMContext.h&quot;
+#include &quot;llvm/IR/Module.h&quot;
+#include &quot;llvm/IR/PassManager.h&quot;
+#include &quot;llvm/IR/Type.h&quot;
+#include &quot;llvm/IR/Verifier.h&quot;
+#include &quot;llvm/Passes/PassBuilder.h&quot;
+#include &quot;llvm/Passes/StandardInstrumentations.h&quot;
+#include &quot;llvm/Support/TargetSelect.h&quot;
+#include &quot;llvm/Target/TargetMachine.h&quot;
+#include &quot;llvm/Transforms/InstCombine/InstCombine.h&quot;
+#include &quot;llvm/Transforms/Scalar.h&quot;
+#include &quot;llvm/Transforms/Scalar/GVN.h&quot;
+#include &quot;llvm/Transforms/Scalar/Reassociate.h&quot;
+#include &quot;llvm/Transforms/Scalar/SimplifyCFG.h&quot;
+#include &lt;algorithm&gt;
+#include &lt;cassert&gt;
+#include &lt;cctype&gt;
+#include &lt;cstdint&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+using namespace llvm;
+using namespace llvm::orc;
+
+//===----------------------------------------------------------------------===//
+// Lexer
+//===----------------------------------------------------------------------===//
+
+// The lexer returns tokens [0-255] if it is an unknown character, otherwise one
+// of these for known things.
+enum Token {
+  tok_eof = -1,
+
+  // commands
+  tok_def = -2,
+  tok_extern = -3,
+
+  // primary
+  tok_identifier = -4,
+  tok_number = -5,
+
+  // control
+  tok_if = -6,
+  tok_then = -7,
+  tok_else = -8,
+  tok_for = -9,
+  tok_in = -10,
+
+  // operators
+  tok_binary = -11,
+  tok_unary = -12
+};
+
+static std::string IdentifierStr; // Filled in if tok_identifier
+static double NumVal;             // Filled in if tok_number
+
+/// gettok - Return the next token from standard input.
+static int gettok() {
+  static int LastChar = &#x27; &#x27;;
+
+  // Skip any whitespace.
+  while (isspace(LastChar))
+    LastChar = getchar();
+
+  if (isalpha(LastChar)) { // identifier: [a-zA-Z][a-zA-Z0-9]*
+    IdentifierStr = LastChar;
+    while (isalnum((LastChar = getchar())))
+      IdentifierStr += LastChar;
+
+    if (IdentifierStr == &quot;def&quot;)
+      return tok_def;
+    if (IdentifierStr == &quot;extern&quot;)
+      return tok_extern;
+    if (IdentifierStr == &quot;if&quot;)
+      return tok_if;
+    if (IdentifierStr == &quot;then&quot;)
+      return tok_then;
+    if (IdentifierStr == &quot;else&quot;)
+      return tok_else;
+    if (IdentifierStr == &quot;for&quot;)
+      return tok_for;
+    if (IdentifierStr == &quot;in&quot;)
+      return tok_in;
+    if (IdentifierStr == &quot;binary&quot;)
+      return tok_binary;
+    if (IdentifierStr == &quot;unary&quot;)
+      return tok_unary;
+    return tok_identifier;
+  }
+
+  if (isdigit(LastChar) || LastChar == &#x27;.&#x27;) { // Number: [0-9.]+
+    std::string NumStr;
+    do {
+      NumStr += LastChar;
+      LastChar = getchar();
+    } while (isdigit(LastChar) || LastChar == &#x27;.&#x27;);
+
+    NumVal = strtod(NumStr.c_str(), nullptr);
+    return tok_number;
+  }
+
+  if (LastChar == &#x27;#&#x27;) {
+    // Comment until end of line.
+    do
+      LastChar = getchar();
+    while (LastChar != EOF &amp;&amp; LastChar != &#x27;\n&#x27; &amp;&amp; LastChar != &#x27;\r&#x27;);
+
+    if (LastChar != EOF)
+      return gettok();
+  }
+
+  // Check for end of file.  Don&#x27;t eat the EOF.
+  if (LastChar == EOF)
+    return tok_eof;
+
+  // Otherwise, just return the character as its ascii value.
+  int ThisChar = LastChar;
+  LastChar = getchar();
+  return ThisChar;
+}
+
+//===----------------------------------------------------------------------===//
+// Abstract Syntax Tree (aka Parse Tree)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// ExprAST - Base class for all expression nodes.
+class ExprAST {
+public:
+  virtual ~ExprAST() = default;
+
+  virtual Value *codegen() = 0;
+};
+
+/// NumberExprAST - Expression class for numeric literals like &quot;1.0&quot;.
+class NumberExprAST : public ExprAST {
+  double Val;
+
+public:
+  NumberExprAST(double Val) : Val(Val) {}
+
+  Value *codegen() override;
+};
+
+/// VariableExprAST - Expression class for referencing a variable, like &quot;a&quot;.
+class VariableExprAST : public ExprAST {
+  std::string Name;
+
+public:
+  VariableExprAST(const std::string &amp;Name) : Name(Name) {}
+
+  Value *codegen() override;
+};
+
+/// UnaryExprAST - Expression class for a unary operator.
+class UnaryExprAST : public ExprAST {
+  char Opcode;
+  std::unique_ptr&lt;ExprAST&gt; Operand;
+
+public:
+  UnaryExprAST(char Opcode, std::unique_ptr&lt;ExprAST&gt; Operand)
+      : Opcode(Opcode), Operand(std::move(Operand)) {}
+
+  Value *codegen() override;
+};
+
+/// BinaryExprAST - Expression class for a binary operator.
+class BinaryExprAST : public ExprAST {
+  char Op;
+  std::unique_ptr&lt;ExprAST&gt; LHS, RHS;
+
+public:
+  BinaryExprAST(char Op, std::unique_ptr&lt;ExprAST&gt; LHS,
+                std::unique_ptr&lt;ExprAST&gt; RHS)
+      : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+
+  Value *codegen() override;
+};
+
+/// CallExprAST - Expression class for function calls.
+class CallExprAST : public ExprAST {
+  std::string Callee;
+  std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args;
+
+public:
+  CallExprAST(const std::string &amp;Callee,
+              std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args)
+      : Callee(Callee), Args(std::move(Args)) {}
+
+  Value *codegen() override;
+};
+
+/// IfExprAST - Expression class for if/then/else.
+class IfExprAST : public ExprAST {
+  std::unique_ptr&lt;ExprAST&gt; Cond, Then, Else;
+
+public:
+  IfExprAST(std::unique_ptr&lt;ExprAST&gt; Cond, std::unique_ptr&lt;ExprAST&gt; Then,
+            std::unique_ptr&lt;ExprAST&gt; Else)
+      : Cond(std::move(Cond)), Then(std::move(Then)), Else(std::move(Else)) {}
+
+  Value *codegen() override;
+};
+
+/// ForExprAST - Expression class for for/in.
+class ForExprAST : public ExprAST {
+  std::string VarName;
+  std::unique_ptr&lt;ExprAST&gt; Start, End, Step, Body;
+
+public:
+  ForExprAST(const std::string &amp;VarName, std::unique_ptr&lt;ExprAST&gt; Start,
+             std::unique_ptr&lt;ExprAST&gt; End, std::unique_ptr&lt;ExprAST&gt; Step,
+             std::unique_ptr&lt;ExprAST&gt; Body)
+      : VarName(VarName), Start(std::move(Start)), End(std::move(End)),
+        Step(std::move(Step)), Body(std::move(Body)) {}
+
+  Value *codegen() override;
+};
+
+/// PrototypeAST - This class represents the &quot;prototype&quot; for a function,
+/// which captures its name, and its argument names (thus implicitly the number
+/// of arguments the function takes), as well as if it is an operator.
+class PrototypeAST {
+  std::string Name;
+  std::vector&lt;std::string&gt; Args;
+  bool IsOperator;
+  unsigned Precedence; // Precedence if a binary op.
+
+public:
+  PrototypeAST(const std::string &amp;Name, std::vector&lt;std::string&gt; Args,
+               bool IsOperator = false, unsigned Prec = 0)
+      : Name(Name), Args(std::move(Args)), IsOperator(IsOperator),
+        Precedence(Prec) {}
+
+  Function *codegen();
+  const std::string &amp;getName() const { return Name; }
+
+  bool isUnaryOp() const { return IsOperator &amp;&amp; Args.size() == 1; }
+  bool isBinaryOp() const { return IsOperator &amp;&amp; Args.size() == 2; }
+
+  char getOperatorName() const {
+    assert(isUnaryOp() || isBinaryOp());
+    return Name[Name.size() - 1];
+  }
+
+  unsigned getBinaryPrecedence() const { return Precedence; }
+};
+
+/// FunctionAST - This class represents a function definition itself.
+class FunctionAST {
+  std::unique_ptr&lt;PrototypeAST&gt; Proto;
+  std::unique_ptr&lt;ExprAST&gt; Body;
+
+public:
+  FunctionAST(std::unique_ptr&lt;PrototypeAST&gt; Proto,
+              std::unique_ptr&lt;ExprAST&gt; Body)
+      : Proto(std::move(Proto)), Body(std::move(Body)) {}
+
+  Function *codegen();
+};
+
+} // end anonymous namespace
+
+//===----------------------------------------------------------------------===//
+// Parser
+//===----------------------------------------------------------------------===//
+
+/// CurTok/getNextToken - Provide a simple token buffer.  CurTok is the current
+/// token the parser is looking at.  getNextToken reads another token from the
+/// lexer and updates CurTok with its results.
+static int CurTok;
+static int getNextToken() { return CurTok = gettok(); }
+
+/// BinopPrecedence - This holds the precedence for each binary operator that is
+/// defined.
+static std::map&lt;char, int&gt; BinopPrecedence;
+
+/// GetTokPrecedence - Get the precedence of the pending binary operator token.
+static int GetTokPrecedence() {
+  if (!isascii(CurTok))
+    return -1;
+
+  // Make sure it&#x27;s a declared binop.
+  int TokPrec = BinopPrecedence[CurTok];
+  if (TokPrec &lt;= 0)
+    return -1;
+  return TokPrec;
+}
+
+/// Error* - These are little helper functions for error handling.
+std::unique_ptr&lt;ExprAST&gt; LogError(const char *Str) {
+  fprintf(stderr, &quot;Error: %s\n&quot;, Str);
+  return nullptr;
+}
+
+std::unique_ptr&lt;PrototypeAST&gt; LogErrorP(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+static std::unique_ptr&lt;ExprAST&gt; ParseExpression();
+
+/// numberexpr ::= number
+static std::unique_ptr&lt;ExprAST&gt; ParseNumberExpr() {
+  auto Result = std::make_unique&lt;NumberExprAST&gt;(NumVal);
+  getNextToken(); // consume the number
+  return std::move(Result);
+}
+
+/// parenexpr ::= &#x27;(&#x27; expression &#x27;)&#x27;
+static std::unique_ptr&lt;ExprAST&gt; ParseParenExpr() {
+  getNextToken(); // eat (.
+  auto V = ParseExpression();
+  if (!V)
+    return nullptr;
+
+  if (CurTok != &#x27;)&#x27;)
+    return LogError(&quot;expected &#x27;)&#x27;&quot;);
+  getNextToken(); // eat ).
+  return V;
+}
+
+/// identifierexpr
+///   ::= identifier
+///   ::= identifier &#x27;(&#x27; expression* &#x27;)&#x27;
+static std::unique_ptr&lt;ExprAST&gt; ParseIdentifierExpr() {
+  std::string IdName = IdentifierStr;
+
+  getNextToken(); // eat identifier.
+
+  if (CurTok != &#x27;(&#x27;) // Simple variable ref.
+    return std::make_unique&lt;VariableExprAST&gt;(IdName);
+
+  // Call.
+  getNextToken(); // eat (
+  std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args;
+  if (CurTok != &#x27;)&#x27;) {
+    while (true) {
+      if (auto Arg = ParseExpression())
+        Args.push_back(std::move(Arg));
+      else
+        return nullptr;
+
+      if (CurTok == &#x27;)&#x27;)
+        break;
+
+      if (CurTok != &#x27;,&#x27;)
+        return LogError(&quot;Expected &#x27;)&#x27; or &#x27;,&#x27; in argument list&quot;);
+      getNextToken();
+    }
+  }
+
+  // Eat the &#x27;)&#x27;.
+  getNextToken();
+
+  return std::make_unique&lt;CallExprAST&gt;(IdName, std::move(Args));
+}
+
+/// ifexpr ::= &#x27;if&#x27; expression &#x27;then&#x27; expression &#x27;else&#x27; expression
+static std::unique_ptr&lt;ExprAST&gt; ParseIfExpr() {
+  getNextToken(); // eat the if.
+
+  // condition.
+  auto Cond = ParseExpression();
+  if (!Cond)
+    return nullptr;
+
+  if (CurTok != tok_then)
+    return LogError(&quot;expected then&quot;);
+  getNextToken(); // eat the then
+
+  auto Then = ParseExpression();
+  if (!Then)
+    return nullptr;
+
+  if (CurTok != tok_else)
+    return LogError(&quot;expected else&quot;);
+
+  getNextToken();
+
+  auto Else = ParseExpression();
+  if (!Else)
+    return nullptr;
+
+  return std::make_unique&lt;IfExprAST&gt;(std::move(Cond), std::move(Then),
+                                      std::move(Else));
+}
+
+/// forexpr ::= &#x27;for&#x27; identifier &#x27;=&#x27; expr &#x27;,&#x27; expr (&#x27;,&#x27; expr)? &#x27;in&#x27; expression
+static std::unique_ptr&lt;ExprAST&gt; ParseForExpr() {
+  getNextToken(); // eat the for.
+
+  if (CurTok != tok_identifier)
+    return LogError(&quot;expected identifier after for&quot;);
+
+  std::string IdName = IdentifierStr;
+  getNextToken(); // eat identifier.
+
+  if (CurTok != &#x27;=&#x27;)
+    return LogError(&quot;expected &#x27;=&#x27; after for&quot;);
+  getNextToken(); // eat &#x27;=&#x27;.
+
+  auto Start = ParseExpression();
+  if (!Start)
+    return nullptr;
+  if (CurTok != &#x27;,&#x27;)
+    return LogError(&quot;expected &#x27;,&#x27; after for start value&quot;);
+  getNextToken();
+
+  auto End = ParseExpression();
+  if (!End)
+    return nullptr;
+
+  // The step value is optional.
+  std::unique_ptr&lt;ExprAST&gt; Step;
+  if (CurTok == &#x27;,&#x27;) {
+    getNextToken();
+    Step = ParseExpression();
+    if (!Step)
+      return nullptr;
+  }
+
+  if (CurTok != tok_in)
+    return LogError(&quot;expected &#x27;in&#x27; after for&quot;);
+  getNextToken(); // eat &#x27;in&#x27;.
+
+  auto Body = ParseExpression();
+  if (!Body)
+    return nullptr;
+
+  return std::make_unique&lt;ForExprAST&gt;(IdName, std::move(Start), std::move(End),
+                                       std::move(Step), std::move(Body));
+}
+
+/// primary
+///   ::= identifierexpr
+///   ::= numberexpr
+///   ::= parenexpr
+///   ::= ifexpr
+///   ::= forexpr
+static std::unique_ptr&lt;ExprAST&gt; ParsePrimary() {
+  switch (CurTok) {
+  default:
+    return LogError(&quot;unknown token when expecting an expression&quot;);
+  case tok_identifier:
+    return ParseIdentifierExpr();
+  case tok_number:
+    return ParseNumberExpr();
+  case &#x27;(&#x27;:
+    return ParseParenExpr();
+  case tok_if:
+    return ParseIfExpr();
+  case tok_for:
+    return ParseForExpr();
+  }
+}
+
+/// unary
+///   ::= primary
+///   ::= &#x27;!&#x27; unary
+static std::unique_ptr&lt;ExprAST&gt; ParseUnary() {
+  // If the current token is not an operator, it must be a primary expr.
+  if (!isascii(CurTok) || CurTok == &#x27;(&#x27; || CurTok == &#x27;,&#x27;)
+    return ParsePrimary();
+
+  // If this is a unary operator, read it.
+  int Opc = CurTok;
+  getNextToken();
+  if (auto Operand = ParseUnary())
+    return std::make_unique&lt;UnaryExprAST&gt;(Opc, std::move(Operand));
+  return nullptr;
+}
+
+/// binoprhs
+///   ::= (&#x27;+&#x27; unary)*
+static std::unique_ptr&lt;ExprAST&gt; ParseBinOpRHS(int ExprPrec,
+                                              std::unique_ptr&lt;ExprAST&gt; LHS) {
+  // If this is a binop, find its precedence.
+  while (true) {
+    int TokPrec = GetTokPrecedence();
+
+    // If this is a binop that binds at least as tightly as the current binop,
+    // consume it, otherwise we are done.
+    if (TokPrec &lt; ExprPrec)
+      return LHS;
+
+    // Okay, we know this is a binop.
+    int BinOp = CurTok;
+    getNextToken(); // eat binop
+
+    // Parse the unary expression after the binary operator.
+    auto RHS = ParseUnary();
+    if (!RHS)
+      return nullptr;
+
+    // If BinOp binds less tightly with RHS than the operator after RHS, let
+    // the pending operator take RHS as its LHS.
+    int NextPrec = GetTokPrecedence();
+    if (TokPrec &lt; NextPrec) {
+      RHS = ParseBinOpRHS(TokPrec + 1, std::move(RHS));
+      if (!RHS)
+        return nullptr;
+    }
+
+    // Merge LHS/RHS.
+    LHS =
+        std::make_unique&lt;BinaryExprAST&gt;(BinOp, std::move(LHS), std::move(RHS));
+  }
+}
+
+/// expression
+///   ::= unary binoprhs
+///
+static std::unique_ptr&lt;ExprAST&gt; ParseExpression() {
+  auto LHS = ParseUnary();
+  if (!LHS)
+    return nullptr;
+
+  return ParseBinOpRHS(0, std::move(LHS));
+}
+
+/// prototype
+///   ::= id &#x27;(&#x27; id* &#x27;)&#x27;
+///   ::= binary LETTER number? (id, id)
+///   ::= unary LETTER (id)
+static std::unique_ptr&lt;PrototypeAST&gt; ParsePrototype() {
+  std::string FnName;
+
+  unsigned Kind = 0; // 0 = identifier, 1 = unary, 2 = binary.
+  unsigned BinaryPrecedence = 30;
+
+  switch (CurTok) {
+  default:
+    return LogErrorP(&quot;Expected function name in prototype&quot;);
+  case tok_identifier:
+    FnName = IdentifierStr;
+    Kind = 0;
+    getNextToken();
+    break;
+  case tok_unary:
+    getNextToken();
+    if (!isascii(CurTok))
+      return LogErrorP(&quot;Expected unary operator&quot;);
+    FnName = &quot;unary&quot;;
+    FnName += (char)CurTok;
+    Kind = 1;
+    getNextToken();
+    break;
+  case tok_binary:
+    getNextToken();
+    if (!isascii(CurTok))
+      return LogErrorP(&quot;Expected binary operator&quot;);
+    FnName = &quot;binary&quot;;
+    FnName += (char)CurTok;
+    Kind = 2;
+    getNextToken();
+
+    // Read the precedence if present.
+    if (CurTok == tok_number) {
+      if (NumVal &lt; 1 || NumVal &gt; 100)
+        return LogErrorP(&quot;Invalid precedence: must be 1..100&quot;);
+      BinaryPrecedence = (unsigned)NumVal;
+      getNextToken();
+    }
+    break;
+  }
+
+  if (CurTok != &#x27;(&#x27;)
+    return LogErrorP(&quot;Expected &#x27;(&#x27; in prototype&quot;);
+
+  std::vector&lt;std::string&gt; ArgNames;
+  while (getNextToken() == tok_identifier)
+    ArgNames.push_back(IdentifierStr);
+  if (CurTok != &#x27;)&#x27;)
+    return LogErrorP(&quot;Expected &#x27;)&#x27; in prototype&quot;);
+
+  // success.
+  getNextToken(); // eat &#x27;)&#x27;.
+
+  // Verify right number of names for operator.
+  if (Kind &amp;&amp; ArgNames.size() != Kind)
+    return LogErrorP(&quot;Invalid number of operands for operator&quot;);
+
+  return std::make_unique&lt;PrototypeAST&gt;(FnName, ArgNames, Kind != 0,
+                                         BinaryPrecedence);
+}
+
+/// definition ::= &#x27;def&#x27; prototype expression
+static std::unique_ptr&lt;FunctionAST&gt; ParseDefinition() {
+  getNextToken(); // eat def.
+  auto Proto = ParsePrototype();
+  if (!Proto)
+    return nullptr;
+
+  if (auto E = ParseExpression())
+    return std::make_unique&lt;FunctionAST&gt;(std::move(Proto), std::move(E));
+  return nullptr;
+}
+
+/// toplevelexpr ::= expression
+static std::unique_ptr&lt;FunctionAST&gt; ParseTopLevelExpr() {
+  if (auto E = ParseExpression()) {
+    // Make an anonymous proto.
+    auto Proto = std::make_unique&lt;PrototypeAST&gt;(&quot;__anon_expr&quot;,
+                                                 std::vector&lt;std::string&gt;());
+    return std::make_unique&lt;FunctionAST&gt;(std::move(Proto), std::move(E));
+  }
+  return nullptr;
+}
+
+/// external ::= &#x27;extern&#x27; prototype
+static std::unique_ptr&lt;PrototypeAST&gt; ParseExtern() {
+  getNextToken(); // eat extern.
+  return ParsePrototype();
+}
+
+//===----------------------------------------------------------------------===//
+// Code Generation
+//===----------------------------------------------------------------------===//
+
+static std::unique_ptr&lt;LLVMContext&gt; TheContext;
+static std::unique_ptr&lt;Module&gt; TheModule;
+static std::unique_ptr&lt;IRBuilder&lt;&gt;&gt; Builder;
+static std::map&lt;std::string, Value *&gt; NamedValues;
+static std::unique_ptr&lt;KaleidoscopeJIT&gt; TheJIT;
+static std::unique_ptr&lt;FunctionPassManager&gt; TheFPM;
+static std::unique_ptr&lt;LoopAnalysisManager&gt; TheLAM;
+static std::unique_ptr&lt;FunctionAnalysisManager&gt; TheFAM;
+static std::unique_ptr&lt;CGSCCAnalysisManager&gt; TheCGAM;
+static std::unique_ptr&lt;ModuleAnalysisManager&gt; TheMAM;
+static std::unique_ptr&lt;PassInstrumentationCallbacks&gt; ThePIC;
+static std::unique_ptr&lt;StandardInstrumentations&gt; TheSI;
+static std::map&lt;std::string, std::unique_ptr&lt;PrototypeAST&gt;&gt; FunctionProtos;
+static ExitOnError ExitOnErr;
+
+Value *LogErrorV(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+Function *getFunction(std::string Name) {
+  // First, see if the function has already been added to the current module.
+  if (auto *F = TheModule-&gt;getFunction(Name))
+    return F;
+
+  // If not, check whether we can codegen the declaration from some existing
+  // prototype.
+  auto FI = FunctionProtos.find(Name);
+  if (FI != FunctionProtos.end())
+    return FI-&gt;second-&gt;codegen();
+
+  // If no existing prototype exists, return null.
+  return nullptr;
+}
+
+Value *NumberExprAST::codegen() {
+  return ConstantFP::get(*TheContext, APFloat(Val));
+}
+
+Value *VariableExprAST::codegen() {
+  // Look this variable up in the function.
+  Value *V = NamedValues[Name];
+  if (!V)
+    return LogErrorV(&quot;Unknown variable name&quot;);
+  return V;
+}
+
+Value *UnaryExprAST::codegen() {
+  Value *OperandV = Operand-&gt;codegen();
+  if (!OperandV)
+    return nullptr;
+
+  Function *F = getFunction(std::string(&quot;unary&quot;) + Opcode);
+  if (!F)
+    return LogErrorV(&quot;Unknown unary operator&quot;);
+
+  return Builder-&gt;CreateCall(F, OperandV, &quot;unop&quot;);
+}
+
+Value *BinaryExprAST::codegen() {
+  Value *L = LHS-&gt;codegen();
+  Value *R = RHS-&gt;codegen();
+  if (!L || !R)
+    return nullptr;
+
+  switch (Op) {
+  case &#x27;+&#x27;:
+    return Builder-&gt;CreateFAdd(L, R, &quot;addtmp&quot;);
+  case &#x27;-&#x27;:
+    return Builder-&gt;CreateFSub(L, R, &quot;subtmp&quot;);
+  case &#x27;*&#x27;:
+    return Builder-&gt;CreateFMul(L, R, &quot;multmp&quot;);
+  case &#x27;&lt;&#x27;:
+    L = Builder-&gt;CreateFCmpULT(L, R, &quot;cmptmp&quot;);
+    // Convert bool 0/1 to double 0.0 or 1.0
+    return Builder-&gt;CreateUIToFP(L, Type::getDoubleTy(*TheContext), &quot;booltmp&quot;);
+  default:
+    break;
+  }
+
+  // If it wasn&#x27;t a builtin binary operator, it must be a user defined one. Emit
+  // a call to it.
+  Function *F = getFunction(std::string(&quot;binary&quot;) + Op);
+  assert(F &amp;&amp; &quot;binary operator not found!&quot;);
+
+  Value *Ops[] = {L, R};
+  return Builder-&gt;CreateCall(F, Ops, &quot;binop&quot;);
+}
+
+Value *CallExprAST::codegen() {
+  // Look up the name in the global module table.
+  Function *CalleeF = getFunction(Callee);
+  if (!CalleeF)
+    return LogErrorV(&quot;Unknown function referenced&quot;);
+
+  // If argument mismatch error.
+  if (CalleeF-&gt;arg_size() != Args.size())
+    return LogErrorV(&quot;Incorrect # arguments passed&quot;);
+
+  std::vector&lt;Value *&gt; ArgsV;
+  for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+    ArgsV.push_back(Args[i]-&gt;codegen());
+    if (!ArgsV.back())
+      return nullptr;
+  }
+
+  return Builder-&gt;CreateCall(CalleeF, ArgsV, &quot;calltmp&quot;);
+}
+
+Value *IfExprAST::codegen() {
+  Value *CondV = Cond-&gt;codegen();
+  if (!CondV)
+    return nullptr;
+
+  // Convert condition to a bool by comparing non-equal to 0.0.
+  CondV = Builder-&gt;CreateFCmpONE(
+      CondV, ConstantFP::get(*TheContext, APFloat(0.0)), &quot;ifcond&quot;);
+
+  Function *TheFunction = Builder-&gt;GetInsertBlock()-&gt;getParent();
+
+  // Create blocks for the then and else cases.  Insert the &#x27;then&#x27; block at the
+  // end of the function.
+  BasicBlock *ThenBB = BasicBlock::Create(*TheContext, &quot;then&quot;, TheFunction);
+  BasicBlock *ElseBB = BasicBlock::Create(*TheContext, &quot;else&quot;);
+  BasicBlock *MergeBB = BasicBlock::Create(*TheContext, &quot;ifcont&quot;);
+
+  Builder-&gt;CreateCondBr(CondV, ThenBB, ElseBB);
+
+  // Emit then value.
+  Builder-&gt;SetInsertPoint(ThenBB);
+
+  Value *ThenV = Then-&gt;codegen();
+  if (!ThenV)
+    return nullptr;
+
+  Builder-&gt;CreateBr(MergeBB);
+  // Codegen of &#x27;Then&#x27; can change the current block, update ThenBB for the PHI.
+  ThenBB = Builder-&gt;GetInsertBlock();
+
+  // Emit else block.
+  TheFunction-&gt;insert(TheFunction-&gt;end(), ElseBB);
+  Builder-&gt;SetInsertPoint(ElseBB);
+
+  Value *ElseV = Else-&gt;codegen();
+  if (!ElseV)
+    return nullptr;
+
+  Builder-&gt;CreateBr(MergeBB);
+  // Codegen of &#x27;Else&#x27; can change the current block, update ElseBB for the PHI.
+  ElseBB = Builder-&gt;GetInsertBlock();
+
+  // Emit merge block.
+  TheFunction-&gt;insert(TheFunction-&gt;end(), MergeBB);
+  Builder-&gt;SetInsertPoint(MergeBB);
+  PHINode *PN = Builder-&gt;CreatePHI(Type::getDoubleTy(*TheContext), 2, &quot;iftmp&quot;);
+
+  PN-&gt;addIncoming(ThenV, ThenBB);
+  PN-&gt;addIncoming(ElseV, ElseBB);
+  return PN;
+}
+
+// Output for-loop as:
+//   ...
+//   start = startexpr
+//   goto loop
+// loop:
+//   variable = phi [start, loopheader], [nextvariable, loopend]
+//   ...
+//   bodyexpr
+//   ...
+// loopend:
+//   step = stepexpr
+//   nextvariable = variable + step
+//   endcond = endexpr
+//   br endcond, loop, endloop
+// outloop:
+Value *ForExprAST::codegen() {
+  // Emit the start code first, without &#x27;variable&#x27; in scope.
+  Value *StartVal = Start-&gt;codegen();
+  if (!StartVal)
+    return nullptr;
+
+  // Make the new basic block for the loop header, inserting after current
+  // block.
+  Function *TheFunction = Builder-&gt;GetInsertBlock()-&gt;getParent();
+  BasicBlock *PreheaderBB = Builder-&gt;GetInsertBlock();
+  BasicBlock *LoopBB = BasicBlock::Create(*TheContext, &quot;loop&quot;, TheFunction);
+
+  // Insert an explicit fall through from the current block to the LoopBB.
+  Builder-&gt;CreateBr(LoopBB);
+
+  // Start insertion in LoopBB.
+  Builder-&gt;SetInsertPoint(LoopBB);
+
+  // Start the PHI node with an entry for Start.
+  PHINode *Variable =
+      Builder-&gt;CreatePHI(Type::getDoubleTy(*TheContext), 2, VarName);
+  Variable-&gt;addIncoming(StartVal, PreheaderBB);
+
+  // Within the loop, the variable is defined equal to the PHI node.  If it
+  // shadows an existing variable, we have to restore it, so save it now.
+  Value *OldVal = NamedValues[VarName];
+  NamedValues[VarName] = Variable;
+
+  // Emit the body of the loop.  This, like any other expr, can change the
+  // current BB.  Note that we ignore the value computed by the body, but don&#x27;t
+  // allow an error.
+  if (!Body-&gt;codegen())
+    return nullptr;
+
+  // Emit the step value.
+  Value *StepVal = nullptr;
+  if (Step) {
+    StepVal = Step-&gt;codegen();
+    if (!StepVal)
+      return nullptr;
+  } else {
+    // If not specified, use 1.0.
+    StepVal = ConstantFP::get(*TheContext, APFloat(1.0));
+  }
+
+  Value *NextVar = Builder-&gt;CreateFAdd(Variable, StepVal, &quot;nextvar&quot;);
+
+  // Compute the end condition.
+  Value *EndCond = End-&gt;codegen();
+  if (!EndCond)
+    return nullptr;
+
+  // Convert condition to a bool by comparing non-equal to 0.0.
+  EndCond = Builder-&gt;CreateFCmpONE(
+      EndCond, ConstantFP::get(*TheContext, APFloat(0.0)), &quot;loopcond&quot;);
+
+  // Create the &quot;after loop&quot; block and insert it.
+  BasicBlock *LoopEndBB = Builder-&gt;GetInsertBlock();
+  BasicBlock *AfterBB =
+      BasicBlock::Create(*TheContext, &quot;afterloop&quot;, TheFunction);
+
+  // Insert the conditional branch into the end of LoopEndBB.
+  Builder-&gt;CreateCondBr(EndCond, LoopBB, AfterBB);
+
+  // Any new code will be inserted in AfterBB.
+  Builder-&gt;SetInsertPoint(AfterBB);
+
+  // Add a new entry to the PHI node for the backedge.
+  Variable-&gt;addIncoming(NextVar, LoopEndBB);
+
+  // Restore the unshadowed variable.
+  if (OldVal)
+    NamedValues[VarName] = OldVal;
+  else
+    NamedValues.erase(VarName);
+
+  // for expr always returns 0.0.
+  return Constant::getNullValue(Type::getDoubleTy(*TheContext));
+}
+
+Function *PrototypeAST::codegen() {
+  // Make the function type:  double(double,double) etc.
+  std::vector&lt;Type *&gt; Doubles(Args.size(), Type::getDoubleTy(*TheContext));
+  FunctionType *FT =
+      FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false);
+
+  Function *F =
+      Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
+
+  // Set names for all arguments.
+  unsigned Idx = 0;
+  for (auto &amp;Arg : F-&gt;args())
+    Arg.setName(Args[Idx++]);
+
+  return F;
+}
+
+Function *FunctionAST::codegen() {
+  // Transfer ownership of the prototype to the FunctionProtos map, but keep a
+  // reference to it for use below.
+  auto &amp;P = *Proto;
+  FunctionProtos[Proto-&gt;getName()] = std::move(Proto);
+  Function *TheFunction = getFunction(P.getName());
+  if (!TheFunction)
+    return nullptr;
+
+  // If this is an operator, install it.
+  if (P.isBinaryOp())
+    BinopPrecedence[P.getOperatorName()] = P.getBinaryPrecedence();
+
+  // Create a new basic block to start insertion into.
+  BasicBlock *BB = BasicBlock::Create(*TheContext, &quot;entry&quot;, TheFunction);
+  Builder-&gt;SetInsertPoint(BB);
+
+  // Record the function arguments in the NamedValues map.
+  NamedValues.clear();
+  for (auto &amp;Arg : TheFunction-&gt;args())
+    NamedValues[std::string(Arg.getName())] = &amp;Arg;
+
+  if (Value *RetVal = Body-&gt;codegen()) {
+    // Finish off the function.
+    Builder-&gt;CreateRet(RetVal);
+
+    // Validate the generated code, checking for consistency.
+    verifyFunction(*TheFunction);
+
+    // Run the optimizer on the function.
+    TheFPM-&gt;run(*TheFunction, *TheFAM);
+
+    return TheFunction;
+  }
+
+  // Error reading body, remove function.
+  TheFunction-&gt;eraseFromParent();
+
+  if (P.isBinaryOp())
+    BinopPrecedence.erase(P.getOperatorName());
+  return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// Top-Level parsing and JIT Driver
+//===----------------------------------------------------------------------===//
+
+static void InitializeModuleAndManagers() {
+  // Open a new context and module.
+  TheContext = std::make_unique&lt;LLVMContext&gt;();
+  TheModule = std::make_unique&lt;Module&gt;(&quot;KaleidoscopeJIT&quot;, *TheContext);
+  TheModule-&gt;setTargetTriple(TheJIT-&gt;getTargetTriple());
+  TheModule-&gt;setDataLayout(TheJIT-&gt;getDataLayout());
+
+  // Create a new builder for the module.
+  Builder = std::make_unique&lt;IRBuilder&lt;&gt;&gt;(*TheModule);
+
+  // Create new pass and analysis managers.
+  TheFPM = std::make_unique&lt;FunctionPassManager&gt;();
+  TheLAM = std::make_unique&lt;LoopAnalysisManager&gt;();
+  TheFAM = std::make_unique&lt;FunctionAnalysisManager&gt;();
+  TheCGAM = std::make_unique&lt;CGSCCAnalysisManager&gt;();
+  TheMAM = std::make_unique&lt;ModuleAnalysisManager&gt;();
+  ThePIC = std::make_unique&lt;PassInstrumentationCallbacks&gt;();
+  TheSI = std::make_unique&lt;StandardInstrumentations&gt;(*TheContext,
+                                                     /*DebugLogging*/ true);
+  TheSI-&gt;registerCallbacks(*ThePIC, TheMAM.get());
+
+  // Add transform passes.
+  // Do simple &quot;peephole&quot; optimizations and bit-twiddling optzns.
+  TheFPM-&gt;addPass(InstCombinePass());
+  // Reassociate expressions.
+  TheFPM-&gt;addPass(ReassociatePass());
+  // Eliminate Common SubExpressions.
+  TheFPM-&gt;addPass(GVNPass());
+  // Simplify the control flow graph (deleting unreachable blocks, etc).
+  TheFPM-&gt;addPass(SimplifyCFGPass());
+
+  // Register analysis passes used in these transform passes.
+  PassBuilder PB(*TheContext);
+  PB.registerModuleAnalyses(*TheMAM);
+  PB.registerFunctionAnalyses(*TheFAM);
+  PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
+}
+
+static void HandleDefinition() {
+  if (auto FnAST = ParseDefinition()) {
+    if (auto *FnIR = FnAST-&gt;codegen()) {
+      fprintf(stderr, &quot;Read function definition:&quot;);
+      FnIR-&gt;print(errs());
+      fprintf(stderr, &quot;\n&quot;);
+      ExitOnErr(TheJIT-&gt;addModule(
+          ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
+      InitializeModuleAndManagers();
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+static void HandleExtern() {
+  if (auto ProtoAST = ParseExtern()) {
+    if (auto *FnIR = ProtoAST-&gt;codegen()) {
+      fprintf(stderr, &quot;Read extern: &quot;);
+      FnIR-&gt;print(errs());
+      fprintf(stderr, &quot;\n&quot;);
+      FunctionProtos[ProtoAST-&gt;getName()] = std::move(ProtoAST);
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+static void HandleTopLevelExpression() {
+  // Evaluate a top-level expression into an anonymous function.
+  if (auto FnAST = ParseTopLevelExpr()) {
+    if (FnAST-&gt;codegen()) {
+      // Create a ResourceTracker to track JIT&#x27;d memory allocated to our
+      // anonymous expression -- that way we can free it after executing.
+      auto RT = TheJIT-&gt;getMainJITDylib().createResourceTracker();
+
+      auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+      ExitOnErr(TheJIT-&gt;addModule(std::move(TSM), RT));
+      InitializeModuleAndManagers();
+
+      // Search the JIT for the __anon_expr symbol.
+      auto ExprSymbol = ExitOnErr(TheJIT-&gt;lookup(&quot;__anon_expr&quot;));
+
+      // Get the symbol&#x27;s address and cast it to the right type (takes no
+      // arguments, returns a double) so we can call it as a native function.
+      double (*FP)() = ExprSymbol.toPtr&lt;double (*)()&gt;();
+      fprintf(stderr, &quot;Evaluated to %f\n&quot;, FP());
+
+      // Delete the anonymous expression module from the JIT.
+      ExitOnErr(RT-&gt;remove());
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+/// top ::= definition | external | expression | &#x27;;&#x27;
+static void MainLoop() {
+  while (true) {
+    fprintf(stderr, &quot;ready&gt; &quot;);
+    switch (CurTok) {
+    case tok_eof:
+      return;
+    case &#x27;;&#x27;: // ignore top-level semicolons.
+      getNextToken();
+      break;
+    case tok_def:
+      HandleDefinition();
+      break;
+    case tok_extern:
+      HandleExtern();
+      break;
+    default:
+      HandleTopLevelExpression();
+      break;
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// &quot;Library&quot; functions that can be &quot;extern&#x27;d&quot; from user code.
+//===----------------------------------------------------------------------===//
+
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+/// putchard - putchar that takes a double and returns 0.
+extern &quot;C&quot; DLLEXPORT double putchard(double X) {
+  fputc((char)X, stderr);
+  return 0;
+}
+
+/// printd - printf that takes a double prints it as &quot;%f\n&quot;, returning 0.
+extern &quot;C&quot; DLLEXPORT double printd(double X) {
+  fprintf(stderr, &quot;%f\n&quot;, X);
+  return 0;
+}
+
+//===----------------------------------------------------------------------===//
+// Main driver code.
+//===----------------------------------------------------------------------===//
+
+int main() {
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+
+  // Install standard binary operators.
+  // 1 is lowest precedence.
+  BinopPrecedence[&#x27;&lt;&#x27;] = 10;
+  BinopPrecedence[&#x27;+&#x27;] = 20;
+  BinopPrecedence[&#x27;-&#x27;] = 20;
+  BinopPrecedence[&#x27;*&#x27;] = 40; // highest.
+
+  // Prime the first token.
+  fprintf(stderr, &quot;ready&gt; &quot;);
+  getNextToken();
+
+  TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
+
+  InitializeModuleAndManagers();
+
+  // Run the main &quot;interpreter loop&quot; now.
+  MainLoop();
+
+  return 0;
+}
+</code></pre>
+<p>下一章：扩展语言——可变变量与 SSA 构造</p><h2 id="references">原文参考链接</h2><ul><li><a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/index.html">Implementing a language with LLVM</a></li><li><a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl06.html#kicking-the-tires">renders the Mandelbrot set</a></li><li><a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl02.html">Chapter 2</a></li><li><a href="Kaleidoscope_Chapter5.html#lexer-extensions-for-if-then-else">previous chapters</a></li><li><a href="http://en.wikipedia.org/wiki/Mandelbrot_set">Mandelbrot Set</a></li><li><a href="Kaleidoscope_Chapter7.html">Next: Extending the language: mutable variables / SSA construction</a></li></ul><footer>原文与示例代码版权归 LLVM Project 及其贡献者；许可及最新内容见 <a href="https://llvm.org/docs/">LLVM 官方文档</a>。中文翻译中标注的“译注”用于补充版本和语义说明。</footer></body></html>

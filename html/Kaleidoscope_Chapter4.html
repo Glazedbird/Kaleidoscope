@@ -1,0 +1,1126 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LLVM Kaleidoscope 第 4 章：添加 JIT 和优化器支持（中文翻译）</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;line-height:1.85;color:#242a35;background:#fff;max-width:920px;margin:0 auto;padding:42px 25px}h1{font-size:2rem;line-height:1.4;margin-bottom:8px}h2{font-size:1.5rem;border-bottom:1px solid #dae0e6;padding:24px 0 10px;margin-top:38px}p{margin:17px 0;font-size:16px}pre{background:#f4f6f9;border:1px solid #e1e6eb;border-radius:0 0 9px 9px;padding:17px;overflow:auto;line-height:1.5;font-size:13px;tab-size:2;margin-top:0}code{font-family:Consolas,"DejaVu Sans Mono",monospace}.code-title{background:#e9edf3;border-radius:9px 9px 0 0;padding:4px 14px;font-size:12px;color:#526174;margin-top:20px}nav{display:flex;flex-wrap:wrap;gap:10px;margin:24px 0;padding:18px;background:#f5f7fa;border-radius:10px}nav a{color:#1656a5;text-decoration:none;font-size:14px}blockquote{border-left:3px solid #888;padding-left:15px}.note{color:#546170;font-size:14px}a{color:#1656a5}@media print{body{padding:0}pre{white-space:pre-wrap;word-wrap:break-word}section{break-inside:auto}}h3{margin-top:30px}img{max-width:100%;height:auto}footer{border-top:1px solid #dae0e6;margin-top:40px;padding-top:15px;font-size:13px;color:#546170}li{margin:8px 0}</style></head><body><h1 id="kaleidoscope-adding-jit-and-optimizer-support">第四章：Kaleidoscope——添加 JIT 和优化器支持</h1><p class="note">根据 <a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl04.html">LLVM 官方第 4 章</a>翻译（原文获取日期：2026-11-10）。正文与各节说明译为中文；C++、LLVM IR、命令及输出完整保留原文。版式参考本项目第 3 章。原文可能使用比本项目 LLVM 18 更新的 API，应配合所安装版本的教程阅读；本页代码不是当前主程序已实现功能的声明。</p><nav aria-label="章节导航"><a href="index.html">目录</a><a href="Kaleidoscope_Chapter3.html">第 3 章：生成 LLVM IR</a><a href="Kaleidoscope_Chapter5.html">第 5 章：控制流</a><a href="Kaleidoscope_Chapter6.html">第 6 章：用户自定义运算符</a><a href="Kaleidoscope_Chapter7.html">第 7 章：可变变量</a><a href="Kaleidoscope_Chapter8.html">第 8 章：编译为目标文件</a><a href="Kaleidoscope_Chapter9.html">第 9 章：添加调试信息</a><a href="Kaleidoscope_Chapter10.html">第 10 章：总结与实用知识</a></nav><nav aria-label="本章目录"><a href="#chapter-4-introduction">4.1 第四章简介</a><a href="#trivial-constant-folding">4.2 简单的常量折叠</a><a href="#llvm-optimization-passes">4.3 LLVM 优化 Pass</a><a href="#adding-a-jit-compiler">4.4 添加 JIT 编译器</a><a href="#full-code-listing">4.5 完整代码清单</a></nav><h2 id="chapter-4-introduction">4.1 第四章简介</h2>
+<p>欢迎来到《使用 LLVM 实现一门语言》第四章。前三章实现了一门简单语言，并加入了生成 LLVM IR 的能力。本章介绍两项新技术：为语言加入优化器和 JIT 编译器支持，展示如何为 Kaleidoscope 生成高效的代码。</p>
+<h2 id="trivial-constant-folding">4.2 简单的常量折叠</h2>
+<p>第三章的示例简洁且易于扩展，但生成的代码还不够理想。不过，编译简单代码时，IRBuilder 已经可以完成一些显而易见的优化：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>ready&gt; def test(x) 1+2+x;
+Read function definition:
+define double @test(double %x) {
+entry:
+        %addtmp = fadd double 3.000000e+00, %x
+        ret double %addtmp
+}
+</code></pre>
+<p>这段 IR 并不是输入所对应 AST 的逐字转换。如果直接转换，应该得到：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>ready&gt; def test(x) 1+2+x;
+Read function definition:
+define double @test(double %x) {
+entry:
+        %addtmp = fadd double 2.000000e+00, 1.000000e+00
+        %addtmp1 = fadd double %addtmp, %x
+        ret double %addtmp1
+}
+</code></pre>
+<p>上面展示的常量折叠是一种非常常见且重要的优化。许多语言实现者甚至会在自己的 AST 表示中加入常量折叠支持。</p>
+<p>使用 LLVM 时，无需在 AST 中实现它。由于构建 LLVM IR 的调用都经过 IRBuilder，它会在被调用时检查是否存在常量折叠机会；如果存在，就直接返回折叠后的常量，而不创建指令。</p>
+<p>这很容易，对吧？实际开发中，建议始终使用 IRBuilder 生成这类代码。它不会增加语法负担，不必在编译器中到处编写常量检查；某些情况下还能大幅减少生成的 IR，尤其是使用宏预处理器或大量常量的语言。</p>
+<p>另一方面，IRBuilder 的分析与指令构建同步进行，这也限制了它的能力。看看稍复杂的例子：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>ready&gt; def test(x) (1+2+x)*(x+(1+2));
+ready&gt; Read function definition:
+define double @test(double %x) {
+entry:
+        %addtmp = fadd double 3.000000e+00, %x
+        %addtmp1 = fadd double %x, 3.000000e+00
+        %multmp = fmul double %addtmp, %addtmp1
+        ret double %multmp
+}
+</code></pre>
+<p>这里乘法左右两侧的值相同。我们希望生成“tmp = x+3; result = tmp*tmp;”，避免计算两次“x+3”。</p>
+<p>仅靠局部分析无法发现并消除这种冗余。这需要两种变换：先对表达式重新结合，使加法具有相同形式，再通过公共子表达式消除（CSE）删除多余的加法指令。LLVM 以 pass 的形式提供了丰富的优化。</p>
+<h2 id="llvm-optimization-passes">4.3 LLVM 优化 Pass</h2>
+<p>LLVM 提供许多优化 pass，各自承担不同任务，也有不同取舍。LLVM 不认为同一组优化适合所有语言和场景，而是让编译器实现者决定采用哪些优化、执行顺序以及适用条件。</p>
+<p>例如，LLVM 支持“整个模块”的 pass，尽可能在较大代码范围内分析，通常覆盖整个文件；若在链接时执行，还能覆盖程序的很大一部分。它也提供“逐函数”的 pass，每次只处理一个函数，不查看其他函数。更多内容见官方的 pass 编写指南和 LLVM pass 列表。</p>
+<p>当前 Kaleidoscope 会随着用户输入逐个生成函数。此时不追求极致优化，而希望尽快完成简单有效的优化，因此选择在用户输入函数后运行少量函数级 pass。若要制作静态 Kaleidoscope 编译器，可以沿用现有代码，只需等整个文件解析完后再运行优化器。</p>
+<p>除了函数级和模块级的区别，pass 还分为变换 pass 和分析 pass。前者修改 IR，后者计算供其他 pass 使用的信息。在加入变换 pass 之前，必须注册其依赖的分析 pass。</p>
+<p>要启用逐函数优化，需要创建 FunctionPassManager，保存并组织要执行的 LLVM 优化。每个需要优化的模块都应有一个新的 FunctionPassManager，因此我们扩充上一章的 InitializeModule()：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>void InitializeModuleAndManagers(void) {
+  // Open a new context and module.
+  TheContext = std::make_unique&lt;LLVMContext&gt;();
+  TheModule = std::make_unique&lt;Module&gt;(&quot;KaleidoscopeJIT&quot;, *TheContext);
+  TheModule-&gt;setDataLayout(TheJIT-&gt;getDataLayout());
+
+  // Create a new builder for the module.
+  Builder = std::make_unique&lt;IRBuilder&lt;&gt;&gt;(*TheContext);
+
+  // Create new pass and analysis managers.
+  TheFPM = std::make_unique&lt;FunctionPassManager&gt;();
+  TheLAM = std::make_unique&lt;LoopAnalysisManager&gt;();
+  TheFAM = std::make_unique&lt;FunctionAnalysisManager&gt;();
+  TheCGAM = std::make_unique&lt;CGSCCAnalysisManager&gt;();
+  TheMAM = std::make_unique&lt;ModuleAnalysisManager&gt;();
+  ThePIC = std::make_unique&lt;PassInstrumentationCallbacks&gt;();
+  TheSI = std::make_unique&lt;StandardInstrumentations&gt;(*TheContext,
+                                                    /*DebugLogging*/ true);
+  TheSI-&gt;registerCallbacks(*ThePIC, TheMAM.get());
+  ...
+</code></pre>
+<p>代码中除了初始化，还调用了 TheModule-&gt;setDataLayout(TheJIT-&gt;getDataLayout())。本章稍后会解释它。</p>
+<p>初始化全局模块 TheModule 和 FunctionPassManager 后，还需要初始化框架的其他部分。四个 AnalysisManager 分别支持 IR 层次结构中四个级别的分析。PassInstrumentationCallbacks 和 StandardInstrumentations 用于 pass 插桩框架，开发者可以借此定制 pass 之间发生的操作。</p>
+<p>管理器就绪后，通过一系列 addPass 调用加入 LLVM 变换 pass：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>// Add transform passes.
+// Do simple &quot;peephole&quot; optimizations and bit-twiddling optzns.
+TheFPM-&gt;addPass(InstCombinePass());
+// Reassociate expressions.
+TheFPM-&gt;addPass(ReassociatePass());
+// Eliminate Common SubExpressions.
+TheFPM-&gt;addPass(GVNPass());
+// Simplify the control flow graph (deleting unreachable blocks, etc).
+TheFPM-&gt;addPass(SimplifyCFGPass());
+</code></pre>
+<p>这里选择四个优化 pass。这是一组常用的清理优化，适用于许多类型的代码。此处不展开其内部原理，但它们是一个合适的起点。</p>
+<p>接下来，注册这些变换 pass 所使用的分析 pass。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>  // Register analysis passes used in these transform passes.
+  PassBuilder PB(*TheContext);
+  PB.registerModuleAnalyses(*TheMAM);
+  PB.registerFunctionAnalyses(*TheFAM);
+  PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
+}
+</code></pre>
+<p>配置好 PassManager 后，需要真正执行它。在 FunctionAST::codegen() 中，新函数构建完成之后、返回给调用方之前运行优化：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>if (Value *RetVal = Body-&gt;codegen()) {
+  // Finish off the function.
+  Builder.CreateRet(RetVal);
+
+  // Validate the generated code, checking for consistency.
+  verifyFunction(*TheFunction);
+
+  // Optimize the function.
+  TheFPM-&gt;run(*TheFunction, *TheFAM);
+
+  return TheFunction;
+}
+</code></pre>
+<p>过程很直接：FunctionPassManager 原地优化并更新 LLVM Function*，改善函数体。现在可以重新尝试上面的测试：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>ready&gt; def test(x) (1+2+x)*(x+(1+2));
+ready&gt; Read function definition:
+define double @test(double %x) {
+entry:
+        %addtmp = fadd double %x, 3.000000e+00
+        %multmp = fmul double %addtmp, %addtmp
+        ret double %multmp
+}
+</code></pre>
+<p>如预期所示，优化后的代码在每次执行函数时都少做一次浮点加法。</p>
+<p>LLVM 还有许多适用于特定场景的优化。各个 pass 的文档尚不完整，也可以参考 Clang 使用的 pass 来选择起点。命令行工具 opt 能让你直接实验不同 pass，观察其效果。</p>
+<p>前端已经能生成较好的代码，接下来讨论如何执行它！</p>
+<h2 id="adding-a-jit-compiler">4.4 添加 JIT 编译器</h2>
+<p>LLVM IR 可以交给多种工具处理：执行优化、导出为文本或二进制形式、针对某个目标生成汇编文件（.s），或进行即时编译。LLVM IR 正是编译器各组成部分之间通用的交换形式。</p>
+<p>本节为解释器添加 JIT 支持。用户仍然输入函数体，但输入的顶层表达式将立即求值。例如输入“1 + 2;”应输出 3；定义函数后，也应能够在交互命令行中调用它。</p>
+<p>为此，先准备好面向本机目标生成代码的环境，并声明、初始化 JIT：调用若干 InitializeNativeTarget* 函数，增加全局变量 TheJIT，并在 main 中初始化：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>static std::unique_ptr&lt;KaleidoscopeJIT&gt; TheJIT;
+...
+int main() {
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+
+  // Install standard binary operators.
+  // 1 is lowest precedence.
+  BinopPrecedence[&#x27;&lt;&#x27;] = 10;
+  BinopPrecedence[&#x27;+&#x27;] = 20;
+  BinopPrecedence[&#x27;-&#x27;] = 20;
+  BinopPrecedence[&#x27;*&#x27;] = 40; // highest.
+
+  // Prime the first token.
+  fprintf(stderr, &quot;ready&gt; &quot;);
+  getNextToken();
+
+  TheJIT = std::make_unique&lt;KaleidoscopeJIT&gt;();
+
+  // Run the main &quot;interpreter loop&quot; now.
+  MainLoop();
+
+  return 0;
+}
+</code></pre>
+<p>还需要设置 JIT 的数据布局。有了 TheJIT 后，可在 InitializeModuleAndManagers 中加入 setDataLayout 调用：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>void InitializeModuleAndManagers(void) {
+  // Open a new context and module.
+  TheContext = std::make_unique&lt;LLVMContext&gt;();
+  TheModule = std::make_unique&lt;Module&gt;(&quot;KaleidoscopeJIT&quot;, *TheContext);
+  TheModule-&gt;setDataLayout(TheJIT-&gt;getDataLayout());
+  ...
+</code></pre>
+<p>KaleidoscopeJIT 是为教程编写的简单 JIT，位于 LLVM 源码的 llvm-src/examples/Kaleidoscope/include/KaleidoscopeJIT.h。后续章节会介绍其实现并扩展功能，这里先直接使用。它的接口很简单：addModule 把 LLVM IR 模块加入 JIT，使其中函数可以执行，相关内存由 ResourceTracker 管理；lookup 则用于查找编译后代码的指针。</p>
+<p>利用这一接口，可以把处理顶层表达式的代码改为：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>static ExitOnError ExitOnErr;
+...
+static void HandleTopLevelExpression() {
+  // Evaluate a top-level expression into an anonymous function.
+  if (auto FnAST = ParseTopLevelExpr()) {
+    if (FnAST-&gt;codegen()) {
+      // Create a ResourceTracker to track JIT&#x27;d memory allocated to our
+      // anonymous expression -- that way we can free it after executing.
+      auto RT = TheJIT-&gt;getMainJITDylib().createResourceTracker();
+
+      auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+      ExitOnErr(TheJIT-&gt;addModule(std::move(TSM), RT));
+      InitializeModuleAndManagers();
+
+      // Search the JIT for the __anon_expr symbol.
+      auto ExprSymbol = ExitOnErr(TheJIT-&gt;lookup(&quot;__anon_expr&quot;));
+
+      // Get the symbol&#x27;s address and cast it to the right type (takes no
+      // arguments, returns a double) so we can call it as a native function.
+      double (*FP)() = ExprSymbol.toPtr&lt;double (*)()&gt;();
+      fprintf(stderr, &quot;Evaluated to %f\n&quot;, FP());
+
+      // Delete the anonymous expression module from the JIT.
+      ExitOnErr(RT-&gt;remove());
+    }
+</code></pre>
+<p>解析和代码生成成功后，调用 addModule，把包含顶层表达式的模块加入 JIT。这会触发模块中函数的代码生成；传入的 ResourceTracker 可用于以后移除该模块。模块交给 JIT 后不能再修改，因此还要调用 InitializeModuleAndManagers()，建立容纳后续代码的新模块。</p>
+<p>添加模块后，需要取得最终代码的指针。调用 JIT 的 lookup，传入顶层表达式函数名 __anon_expr 即可。</p>
+<p>随后取得 __anon_expr 的内存地址。顶层表达式被编译成一个不接收参数、返回 double 的独立 LLVM 函数。LLVM JIT 遵循本机平台 ABI，因此可将结果转换为相应函数指针并直接调用。就调用方式而言，JIT 编译的代码与静态链接到程序中的原生机器码没有区别。</p>
+<p>最后，由于不支持重新计算之前的顶层表达式，执行完成后从 JIT 中移除其模块，释放相关内存。刚才通过 InitializeModuleAndManagers 创建的新模块仍然可用于接收后续代码。</p>
+<p>完成这两处修改后，看看 Kaleidoscope 的运行效果！</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>ready&gt; 4+5;
+Read top-level expression:
+define double @0() {
+entry:
+  ret double 9.000000e+00
+}
+
+Evaluated to 9.000000
+</code></pre>
+<p>基本功能已经能够工作。函数转储展示了为每个顶层表达式合成的“无参数、返回 double”函数。还能做些什么呢？</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>ready&gt; def testfunc(x y) x + y*2;
+Read function definition:
+define double @testfunc(double %x, double %y) {
+entry:
+  %multmp = fmul double %y, 2.000000e+00
+  %addtmp = fadd double %multmp, %x
+  ret double %addtmp
+}
+
+ready&gt; testfunc(4, 10);
+Read top-level expression:
+define double @1() {
+entry:
+  %calltmp = call double @testfunc(double 4.000000e+00, double 1.000000e+01)
+  ret double %calltmp
+}
+
+Evaluated to 24.000000
+
+ready&gt; testfunc(5, 10);
+ready&gt; LLVM ERROR: Program used external function &#x27;testfunc&#x27; which could not be resolved!
+</code></pre>
+<p>函数定义和调用也能工作，但最后一行出了问题。调用本身看起来正确，原因是什么？Module 是 JIT 的分配单位，testfunc 和匿名表达式位于同一个模块。当移除模块以释放匿名表达式的内存时，testfunc 的定义也被删除了；再次调用时，JIT 就找不到它。</p>
+<p>最简单的修复方法是把匿名表达式放进单独的模块。只要被调用函数具有原型，并在调用之前加入 JIT，JIT 就能跨模块解析函数调用。这样删除匿名表达式不会影响其他函数。</p>
+<p>我们进一步把每个函数都放进自己的模块。原教程借此展示了 KaleidoscopeJIT 的一项历史行为：函数可多次加入 JIT，查询符号时返回最新定义，从而使环境更像 REPL；同一模块内的函数定义则必须唯一。请同时阅读下方关于 LLVM 9 之后版本的警告。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>ready&gt; def foo(x) x + 1;
+Read function definition:
+define double @foo(double %x) {
+entry:
+  %addtmp = fadd double %x, 1.000000e+00
+  ret double %addtmp
+}
+
+ready&gt; foo(2);
+Evaluated to 3.000000
+
+ready&gt; def foo(x) x + 2;
+define double @foo(double %x) {
+entry:
+  %addtmp = fadd double %x, 2.000000e+00
+  ret double %addtmp
+}
+
+ready&gt; foo(2);
+Evaluated to 4.000000
+</code></pre>
+<p>为了让每个函数拥有独立模块，需要能够在每个新模块中重新生成之前的函数声明：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>static std::unique_ptr&lt;KaleidoscopeJIT&gt; TheJIT;
+
+...
+
+Function *getFunction(std::string Name) {
+  // First, see if the function has already been added to the current module.
+  if (auto *F = TheModule-&gt;getFunction(Name))
+    return F;
+
+  // If not, check whether we can codegen the declaration from some existing
+  // prototype.
+  auto FI = FunctionProtos.find(Name);
+  if (FI != FunctionProtos.end())
+    return FI-&gt;second-&gt;codegen();
+
+  // If no existing prototype exists, return null.
+  return nullptr;
+}
+
+...
+
+Value *CallExprAST::codegen() {
+  // Look up the name in the global module table.
+  Function *CalleeF = getFunction(Callee);
+
+...
+
+Function *FunctionAST::codegen() {
+  // Transfer ownership of the prototype to the FunctionProtos map, but keep a
+  // reference to it for use below.
+  auto &amp;P = *Proto;
+  FunctionProtos[Proto-&gt;getName()] = std::move(Proto);
+  Function *TheFunction = getFunction(P.getName());
+  if (!TheFunction)
+    return nullptr;
+</code></pre>
+<p>新增全局表 FunctionProtos，保存每个函数最新的原型；再用辅助函数 getFunction() 替代 TheModule-&gt;getFunction()。它先查当前模块，找不到时根据 FunctionProtos 生成声明。CallExprAST::codegen() 只需替换查询调用；FunctionAST::codegen() 则先更新 FunctionProtos，再调用 getFunction()。这样，任何此前声明过的函数都能在当前模块中获得对应声明。</p>
+<p>还需要更新 HandleDefinition 和 HandleExtern：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>static void HandleDefinition() {
+  if (auto FnAST = ParseDefinition()) {
+    if (auto *FnIR = FnAST-&gt;codegen()) {
+      fprintf(stderr, &quot;Read function definition:&quot;);
+      FnIR-&gt;print(errs());
+      fprintf(stderr, &quot;\n&quot;);
+      ExitOnErr(TheJIT-&gt;addModule(
+          ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
+      InitializeModuleAndManagers();
+    }
+  } else {
+    // Skip token for error recovery.
+     getNextToken();
+  }
+}
+
+static void HandleExtern() {
+  if (auto ProtoAST = ParseExtern()) {
+    if (auto *FnIR = ProtoAST-&gt;codegen()) {
+      fprintf(stderr, &quot;Read extern: &quot;);
+      FnIR-&gt;print(errs());
+      fprintf(stderr, &quot;\n&quot;);
+      FunctionProtos[ProtoAST-&gt;getName()] = std::move(ProtoAST);
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+</code></pre>
+<p>HandleDefinition 增加两行，将新定义的函数交给 JIT 并创建新模块；HandleExtern 增加一行，把原型保存到 FunctionProtos。</p>
+<p>版本警告</p>
+<p>从 LLVM 9 开始，不同模块之间也不允许重复符号。因此不能像下面的历史示例那样重定义 Kaleidoscope 函数，请跳过这部分演示。</p>
+<p>原因是较新的 OrcV2 JIT API 尽量遵循静态和动态链接器的规则，其中包括拒绝重复符号。符号名唯一后，JIT 才能以这些名字为键跟踪符号，支持并发编译。</p>
+<p>完成修改后，再次尝试 REPL。这里省略匿名函数的转储，因为你已经了解其形式：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>ready&gt; def foo(x) x + 1;
+ready&gt; foo(2);
+Evaluated to 3.000000
+
+ready&gt; def foo(x) x + 2;
+ready&gt; foo(2);
+Evaluated to 4.000000
+</code></pre>
+<p>运行成功！</p>
+<p>即使代码如此简单，也已经有相当强的能力。看看下面的例子：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>ready&gt; extern sin(x);
+Read extern:
+declare double @sin(double)
+
+ready&gt; extern cos(x);
+Read extern:
+declare double @cos(double)
+
+ready&gt; sin(1.0);
+Read top-level expression:
+define double @2() {
+entry:
+  ret double 0x3FEAED548F090CEE
+}
+
+Evaluated to 0.841471
+
+ready&gt; def foo(x) sin(x)*sin(x) + cos(x)*cos(x);
+Read function definition:
+define double @foo(double %x) {
+entry:
+  %calltmp = call double @sin(double %x)
+  %multmp = fmul double %calltmp, %calltmp
+  %calltmp2 = call double @cos(double %x)
+  %multmp4 = fmul double %calltmp2, %calltmp2
+  %addtmp = fadd double %multmp, %multmp4
+  ret double %addtmp
+}
+
+ready&gt; foo(4.0);
+Read top-level expression:
+define double @3() {
+entry:
+  %calltmp = call double @foo(double 4.000000e+00)
+  ret double %calltmp
+}
+
+Evaluated to 1.000000
+</code></pre>
+<p>JIT 为什么知道 sin 和 cos？原教程通过简单的符号解析规则解释这一过程：先查找已加入 JIT 的模块中的定义；若 JIT 内没有定义，就在 Kaleidoscope 进程中查询，例如调用 dlsym(&quot;sin&quot;)。sin 位于进程地址空间中，因此可将模块中的调用绑定到 libm 实现。对于 sin、cos 等标准数学函数，传入常量时，常量折叠还可能直接求值，例如上面的 sin(1.0)。其中“从新模块向旧模块查找最新定义”的描述属于上述历史实现，重复定义限制仍以版本警告为准。</p>
+<p>以后会看到，调整符号解析规则能够实现许多功能：限制 JIT 代码可访问的符号以增强安全性、根据符号名动态生成代码，以及惰性编译。</p>
+<p>这一规则的直接好处是，可以通过任意 C++ 代码实现新的操作，从而扩展语言。例如加入：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+/// putchard - putchar that takes a double and returns 0.
+extern &quot;C&quot; DLLEXPORT double putchard(double X) {
+  fputc((char)X, stderr);
+  return 0;
+}
+</code></pre>
+<p>在 Windows 上必须显式导出这些函数，因为动态符号加载器会使用 GetProcAddress 查找它们。</p>
+<p>现在可以通过“extern putchard(x); putchard(120);”向控制台输出小写字母 x，120 是它的 ASCII 编码。同样的方法还能实现文件 I/O、控制台输入等功能。</p>
+<p>至此，JIT 和优化器这一章结束。我们已经能在用户交互驱动下，编译、优化并即时执行一门尚不具备图灵完备性的语言。下一章将加入控制流结构，同时讨论一些有趣的 LLVM IR 问题。</p>
+<h2 id="full-code-listing">4.5 完整代码清单</h2>
+<p>下面是加入 LLVM JIT 与优化器后的完整示例。编译命令如下：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code># Compile
+clang++ -g toy.cpp `llvm-config --cxxflags --ldflags --system-libs --libs core orcjit native` -O3 -o toy
+# Run
+./toy
+</code></pre>
+<p>在 Linux 上编译时，还应加入 -rdynamic 选项，确保运行时能够正确解析外部函数。</p>
+<p>完整代码如下：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>#include &quot;../include/KaleidoscopeJIT.h&quot;
+#include &quot;llvm/ADT/APFloat.h&quot;
+#include &quot;llvm/ADT/STLExtras.h&quot;
+#include &quot;llvm/IR/BasicBlock.h&quot;
+#include &quot;llvm/IR/Constants.h&quot;
+#include &quot;llvm/IR/DerivedTypes.h&quot;
+#include &quot;llvm/IR/Function.h&quot;
+#include &quot;llvm/IR/IRBuilder.h&quot;
+#include &quot;llvm/IR/LLVMContext.h&quot;
+#include &quot;llvm/IR/Module.h&quot;
+#include &quot;llvm/IR/PassManager.h&quot;
+#include &quot;llvm/IR/Type.h&quot;
+#include &quot;llvm/IR/Verifier.h&quot;
+#include &quot;llvm/Passes/PassBuilder.h&quot;
+#include &quot;llvm/Passes/StandardInstrumentations.h&quot;
+#include &quot;llvm/Support/TargetSelect.h&quot;
+#include &quot;llvm/Target/TargetMachine.h&quot;
+#include &quot;llvm/Transforms/InstCombine/InstCombine.h&quot;
+#include &quot;llvm/Transforms/Scalar.h&quot;
+#include &quot;llvm/Transforms/Scalar/GVN.h&quot;
+#include &quot;llvm/Transforms/Scalar/Reassociate.h&quot;
+#include &quot;llvm/Transforms/Scalar/SimplifyCFG.h&quot;
+#include &lt;algorithm&gt;
+#include &lt;cassert&gt;
+#include &lt;cctype&gt;
+#include &lt;cstdint&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+using namespace llvm;
+using namespace llvm::orc;
+
+//===----------------------------------------------------------------------===//
+// Lexer
+//===----------------------------------------------------------------------===//
+
+// The lexer returns tokens [0-255] if it is an unknown character, otherwise one
+// of these for known things.
+enum Token {
+  tok_eof = -1,
+
+  // commands
+  tok_def = -2,
+  tok_extern = -3,
+
+  // primary
+  tok_identifier = -4,
+  tok_number = -5
+};
+
+static std::string IdentifierStr; // Filled in if tok_identifier
+static double NumVal;             // Filled in if tok_number
+
+/// gettok - Return the next token from standard input.
+static int gettok() {
+  static int LastChar = &#x27; &#x27;;
+
+  // Skip any whitespace.
+  while (isspace(LastChar))
+    LastChar = getchar();
+
+  if (isalpha(LastChar)) { // identifier: [a-zA-Z][a-zA-Z0-9]*
+    IdentifierStr = LastChar;
+    while (isalnum((LastChar = getchar())))
+      IdentifierStr += LastChar;
+
+    if (IdentifierStr == &quot;def&quot;)
+      return tok_def;
+    if (IdentifierStr == &quot;extern&quot;)
+      return tok_extern;
+    return tok_identifier;
+  }
+
+  if (isdigit(LastChar) || LastChar == &#x27;.&#x27;) { // Number: [0-9.]+
+    std::string NumStr;
+    do {
+      NumStr += LastChar;
+      LastChar = getchar();
+    } while (isdigit(LastChar) || LastChar == &#x27;.&#x27;);
+
+    NumVal = strtod(NumStr.c_str(), nullptr);
+    return tok_number;
+  }
+
+  if (LastChar == &#x27;#&#x27;) {
+    // Comment until end of line.
+    do
+      LastChar = getchar();
+    while (LastChar != EOF &amp;&amp; LastChar != &#x27;\n&#x27; &amp;&amp; LastChar != &#x27;\r&#x27;);
+
+    if (LastChar != EOF)
+      return gettok();
+  }
+
+  // Check for end of file.  Don&#x27;t eat the EOF.
+  if (LastChar == EOF)
+    return tok_eof;
+
+  // Otherwise, just return the character as its ascii value.
+  int ThisChar = LastChar;
+  LastChar = getchar();
+  return ThisChar;
+}
+
+//===----------------------------------------------------------------------===//
+// Abstract Syntax Tree (aka Parse Tree)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// ExprAST - Base class for all expression nodes.
+class ExprAST {
+public:
+  virtual ~ExprAST() = default;
+
+  virtual Value *codegen() = 0;
+};
+
+/// NumberExprAST - Expression class for numeric literals like &quot;1.0&quot;.
+class NumberExprAST : public ExprAST {
+  double Val;
+
+public:
+  NumberExprAST(double Val) : Val(Val) {}
+
+  Value *codegen() override;
+};
+
+/// VariableExprAST - Expression class for referencing a variable, like &quot;a&quot;.
+class VariableExprAST : public ExprAST {
+  std::string Name;
+
+public:
+  VariableExprAST(const std::string &amp;Name) : Name(Name) {}
+
+  Value *codegen() override;
+};
+
+/// BinaryExprAST - Expression class for a binary operator.
+class BinaryExprAST : public ExprAST {
+  char Op;
+  std::unique_ptr&lt;ExprAST&gt; LHS, RHS;
+
+public:
+  BinaryExprAST(char Op, std::unique_ptr&lt;ExprAST&gt; LHS,
+                std::unique_ptr&lt;ExprAST&gt; RHS)
+      : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+
+  Value *codegen() override;
+};
+
+/// CallExprAST - Expression class for function calls.
+class CallExprAST : public ExprAST {
+  std::string Callee;
+  std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args;
+
+public:
+  CallExprAST(const std::string &amp;Callee,
+              std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args)
+      : Callee(Callee), Args(std::move(Args)) {}
+
+  Value *codegen() override;
+};
+
+/// PrototypeAST - This class represents the &quot;prototype&quot; for a function,
+/// which captures its name, and its argument names (thus implicitly the number
+/// of arguments the function takes).
+class PrototypeAST {
+  std::string Name;
+  std::vector&lt;std::string&gt; Args;
+
+public:
+  PrototypeAST(const std::string &amp;Name, std::vector&lt;std::string&gt; Args)
+      : Name(Name), Args(std::move(Args)) {}
+
+  Function *codegen();
+  const std::string &amp;getName() const { return Name; }
+};
+
+/// FunctionAST - This class represents a function definition itself.
+class FunctionAST {
+  std::unique_ptr&lt;PrototypeAST&gt; Proto;
+  std::unique_ptr&lt;ExprAST&gt; Body;
+
+public:
+  FunctionAST(std::unique_ptr&lt;PrototypeAST&gt; Proto,
+              std::unique_ptr&lt;ExprAST&gt; Body)
+      : Proto(std::move(Proto)), Body(std::move(Body)) {}
+
+  Function *codegen();
+};
+
+} // end anonymous namespace
+
+//===----------------------------------------------------------------------===//
+// Parser
+//===----------------------------------------------------------------------===//
+
+/// CurTok/getNextToken - Provide a simple token buffer.  CurTok is the current
+/// token the parser is looking at.  getNextToken reads another token from the
+/// lexer and updates CurTok with its results.
+static int CurTok;
+static int getNextToken() { return CurTok = gettok(); }
+
+/// BinopPrecedence - This holds the precedence for each binary operator that is
+/// defined.
+static std::map&lt;char, int&gt; BinopPrecedence;
+
+/// GetTokPrecedence - Get the precedence of the pending binary operator token.
+static int GetTokPrecedence() {
+  if (!isascii(CurTok))
+    return -1;
+
+  // Make sure it&#x27;s a declared binop.
+  int TokPrec = BinopPrecedence[CurTok];
+  if (TokPrec &lt;= 0)
+    return -1;
+  return TokPrec;
+}
+
+/// LogError* - These are little helper functions for error handling.
+std::unique_ptr&lt;ExprAST&gt; LogError(const char *Str) {
+  fprintf(stderr, &quot;Error: %s\n&quot;, Str);
+  return nullptr;
+}
+
+std::unique_ptr&lt;PrototypeAST&gt; LogErrorP(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+static std::unique_ptr&lt;ExprAST&gt; ParseExpression();
+
+/// numberexpr ::= number
+static std::unique_ptr&lt;ExprAST&gt; ParseNumberExpr() {
+  auto Result = std::make_unique&lt;NumberExprAST&gt;(NumVal);
+  getNextToken(); // consume the number
+  return std::move(Result);
+}
+
+/// parenexpr ::= &#x27;(&#x27; expression &#x27;)&#x27;
+static std::unique_ptr&lt;ExprAST&gt; ParseParenExpr() {
+  getNextToken(); // eat (.
+  auto V = ParseExpression();
+  if (!V)
+    return nullptr;
+
+  if (CurTok != &#x27;)&#x27;)
+    return LogError(&quot;expected &#x27;)&#x27;&quot;);
+  getNextToken(); // eat ).
+  return V;
+}
+
+/// identifierexpr
+///   ::= identifier
+///   ::= identifier &#x27;(&#x27; expression* &#x27;)&#x27;
+static std::unique_ptr&lt;ExprAST&gt; ParseIdentifierExpr() {
+  std::string IdName = IdentifierStr;
+
+  getNextToken(); // eat identifier.
+
+  if (CurTok != &#x27;(&#x27;) // Simple variable ref.
+    return std::make_unique&lt;VariableExprAST&gt;(IdName);
+
+  // Call.
+  getNextToken(); // eat (
+  std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args;
+  if (CurTok != &#x27;)&#x27;) {
+    while (true) {
+      if (auto Arg = ParseExpression())
+        Args.push_back(std::move(Arg));
+      else
+        return nullptr;
+
+      if (CurTok == &#x27;)&#x27;)
+        break;
+
+      if (CurTok != &#x27;,&#x27;)
+        return LogError(&quot;Expected &#x27;)&#x27; or &#x27;,&#x27; in argument list&quot;);
+      getNextToken();
+    }
+  }
+
+  // Eat the &#x27;)&#x27;.
+  getNextToken();
+
+  return std::make_unique&lt;CallExprAST&gt;(IdName, std::move(Args));
+}
+
+/// primary
+///   ::= identifierexpr
+///   ::= numberexpr
+///   ::= parenexpr
+static std::unique_ptr&lt;ExprAST&gt; ParsePrimary() {
+  switch (CurTok) {
+  default:
+    return LogError(&quot;unknown token when expecting an expression&quot;);
+  case tok_identifier:
+    return ParseIdentifierExpr();
+  case tok_number:
+    return ParseNumberExpr();
+  case &#x27;(&#x27;:
+    return ParseParenExpr();
+  }
+}
+
+/// binoprhs
+///   ::= (&#x27;+&#x27; primary)*
+static std::unique_ptr&lt;ExprAST&gt; ParseBinOpRHS(int ExprPrec,
+                                              std::unique_ptr&lt;ExprAST&gt; LHS) {
+  // If this is a binop, find its precedence.
+  while (true) {
+    int TokPrec = GetTokPrecedence();
+
+    // If this is a binop that binds at least as tightly as the current binop,
+    // consume it, otherwise we are done.
+    if (TokPrec &lt; ExprPrec)
+      return LHS;
+
+    // Okay, we know this is a binop.
+    int BinOp = CurTok;
+    getNextToken(); // eat binop
+
+    // Parse the primary expression after the binary operator.
+    auto RHS = ParsePrimary();
+    if (!RHS)
+      return nullptr;
+
+    // If BinOp binds less tightly with RHS than the operator after RHS, let
+    // the pending operator take RHS as its LHS.
+    int NextPrec = GetTokPrecedence();
+    if (TokPrec &lt; NextPrec) {
+      RHS = ParseBinOpRHS(TokPrec + 1, std::move(RHS));
+      if (!RHS)
+        return nullptr;
+    }
+
+    // Merge LHS/RHS.
+    LHS =
+        std::make_unique&lt;BinaryExprAST&gt;(BinOp, std::move(LHS), std::move(RHS));
+  }
+}
+
+/// expression
+///   ::= primary binoprhs
+///
+static std::unique_ptr&lt;ExprAST&gt; ParseExpression() {
+  auto LHS = ParsePrimary();
+  if (!LHS)
+    return nullptr;
+
+  return ParseBinOpRHS(0, std::move(LHS));
+}
+
+/// prototype
+///   ::= id &#x27;(&#x27; id* &#x27;)&#x27;
+static std::unique_ptr&lt;PrototypeAST&gt; ParsePrototype() {
+  if (CurTok != tok_identifier)
+    return LogErrorP(&quot;Expected function name in prototype&quot;);
+
+  std::string FnName = IdentifierStr;
+  getNextToken();
+
+  if (CurTok != &#x27;(&#x27;)
+    return LogErrorP(&quot;Expected &#x27;(&#x27; in prototype&quot;);
+
+  std::vector&lt;std::string&gt; ArgNames;
+  while (getNextToken() == tok_identifier)
+    ArgNames.push_back(IdentifierStr);
+  if (CurTok != &#x27;)&#x27;)
+    return LogErrorP(&quot;Expected &#x27;)&#x27; in prototype&quot;);
+
+  // success.
+  getNextToken(); // eat &#x27;)&#x27;.
+
+  return std::make_unique&lt;PrototypeAST&gt;(FnName, std::move(ArgNames));
+}
+
+/// definition ::= &#x27;def&#x27; prototype expression
+static std::unique_ptr&lt;FunctionAST&gt; ParseDefinition() {
+  getNextToken(); // eat def.
+  auto Proto = ParsePrototype();
+  if (!Proto)
+    return nullptr;
+
+  if (auto E = ParseExpression())
+    return std::make_unique&lt;FunctionAST&gt;(std::move(Proto), std::move(E));
+  return nullptr;
+}
+
+/// toplevelexpr ::= expression
+static std::unique_ptr&lt;FunctionAST&gt; ParseTopLevelExpr() {
+  if (auto E = ParseExpression()) {
+    // Make an anonymous proto.
+    auto Proto = std::make_unique&lt;PrototypeAST&gt;(&quot;__anon_expr&quot;,
+                                                 std::vector&lt;std::string&gt;());
+    return std::make_unique&lt;FunctionAST&gt;(std::move(Proto), std::move(E));
+  }
+  return nullptr;
+}
+
+/// external ::= &#x27;extern&#x27; prototype
+static std::unique_ptr&lt;PrototypeAST&gt; ParseExtern() {
+  getNextToken(); // eat extern.
+  return ParsePrototype();
+}
+
+//===----------------------------------------------------------------------===//
+// Code Generation
+//===----------------------------------------------------------------------===//
+
+static std::unique_ptr&lt;LLVMContext&gt; TheContext;
+static std::unique_ptr&lt;Module&gt; TheModule;
+static std::unique_ptr&lt;IRBuilder&lt;&gt;&gt; Builder;
+static std::map&lt;std::string, Value *&gt; NamedValues;
+static std::unique_ptr&lt;KaleidoscopeJIT&gt; TheJIT;
+static std::unique_ptr&lt;FunctionPassManager&gt; TheFPM;
+static std::unique_ptr&lt;LoopAnalysisManager&gt; TheLAM;
+static std::unique_ptr&lt;FunctionAnalysisManager&gt; TheFAM;
+static std::unique_ptr&lt;CGSCCAnalysisManager&gt; TheCGAM;
+static std::unique_ptr&lt;ModuleAnalysisManager&gt; TheMAM;
+static std::unique_ptr&lt;PassInstrumentationCallbacks&gt; ThePIC;
+static std::unique_ptr&lt;StandardInstrumentations&gt; TheSI;
+static std::map&lt;std::string, std::unique_ptr&lt;PrototypeAST&gt;&gt; FunctionProtos;
+static ExitOnError ExitOnErr;
+
+Value *LogErrorV(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+Function *getFunction(std::string Name) {
+  // First, see if the function has already been added to the current module.
+  if (auto *F = TheModule-&gt;getFunction(Name))
+    return F;
+
+  // If not, check whether we can codegen the declaration from some existing
+  // prototype.
+  auto FI = FunctionProtos.find(Name);
+  if (FI != FunctionProtos.end())
+    return FI-&gt;second-&gt;codegen();
+
+  // If no existing prototype exists, return null.
+  return nullptr;
+}
+
+Value *NumberExprAST::codegen() {
+  return ConstantFP::get(*TheContext, APFloat(Val));
+}
+
+Value *VariableExprAST::codegen() {
+  // Look this variable up in the function.
+  Value *V = NamedValues[Name];
+  if (!V)
+    return LogErrorV(&quot;Unknown variable name&quot;);
+  return V;
+}
+
+Value *BinaryExprAST::codegen() {
+  Value *L = LHS-&gt;codegen();
+  Value *R = RHS-&gt;codegen();
+  if (!L || !R)
+    return nullptr;
+
+  switch (Op) {
+  case &#x27;+&#x27;:
+    return Builder-&gt;CreateFAdd(L, R, &quot;addtmp&quot;);
+  case &#x27;-&#x27;:
+    return Builder-&gt;CreateFSub(L, R, &quot;subtmp&quot;);
+  case &#x27;*&#x27;:
+    return Builder-&gt;CreateFMul(L, R, &quot;multmp&quot;);
+  case &#x27;&lt;&#x27;:
+    L = Builder-&gt;CreateFCmpULT(L, R, &quot;cmptmp&quot;);
+    // Convert bool 0/1 to double 0.0 or 1.0
+    return Builder-&gt;CreateUIToFP(L, Type::getDoubleTy(*TheContext), &quot;booltmp&quot;);
+  default:
+    return LogErrorV(&quot;invalid binary operator&quot;);
+  }
+}
+
+Value *CallExprAST::codegen() {
+  // Look up the name in the global module table.
+  Function *CalleeF = getFunction(Callee);
+  if (!CalleeF)
+    return LogErrorV(&quot;Unknown function referenced&quot;);
+
+  // If argument mismatch error.
+  if (CalleeF-&gt;arg_size() != Args.size())
+    return LogErrorV(&quot;Incorrect # arguments passed&quot;);
+
+  std::vector&lt;Value *&gt; ArgsV;
+  for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+    ArgsV.push_back(Args[i]-&gt;codegen());
+    if (!ArgsV.back())
+      return nullptr;
+  }
+
+  return Builder-&gt;CreateCall(CalleeF, ArgsV, &quot;calltmp&quot;);
+}
+
+Function *PrototypeAST::codegen() {
+  // Make the function type:  double(double,double) etc.
+  std::vector&lt;Type *&gt; Doubles(Args.size(), Type::getDoubleTy(*TheContext));
+  FunctionType *FT =
+      FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false);
+
+  Function *F =
+      Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
+
+  // Set names for all arguments.
+  unsigned Idx = 0;
+  for (auto &amp;Arg : F-&gt;args())
+    Arg.setName(Args[Idx++]);
+
+  return F;
+}
+
+Function *FunctionAST::codegen() {
+  // Transfer ownership of the prototype to the FunctionProtos map, but keep a
+  // reference to it for use below.
+  auto &amp;P = *Proto;
+  FunctionProtos[Proto-&gt;getName()] = std::move(Proto);
+  Function *TheFunction = getFunction(P.getName());
+  if (!TheFunction)
+    return nullptr;
+
+  // Create a new basic block to start insertion into.
+  BasicBlock *BB = BasicBlock::Create(*TheContext, &quot;entry&quot;, TheFunction);
+  Builder-&gt;SetInsertPoint(BB);
+
+  // Record the function arguments in the NamedValues map.
+  NamedValues.clear();
+  for (auto &amp;Arg : TheFunction-&gt;args())
+    NamedValues[std::string(Arg.getName())] = &amp;Arg;
+
+  if (Value *RetVal = Body-&gt;codegen()) {
+    // Finish off the function.
+    Builder-&gt;CreateRet(RetVal);
+
+    // Validate the generated code, checking for consistency.
+    verifyFunction(*TheFunction);
+
+    // Run the optimizer on the function.
+    TheFPM-&gt;run(*TheFunction, *TheFAM);
+
+    return TheFunction;
+  }
+
+  // Error reading body, remove function.
+  TheFunction-&gt;eraseFromParent();
+  return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// Top-Level parsing and JIT Driver
+//===----------------------------------------------------------------------===//
+
+static void InitializeModuleAndManagers() {
+  // Open a new context and module.
+  TheContext = std::make_unique&lt;LLVMContext&gt;();
+  TheModule = std::make_unique&lt;Module&gt;(&quot;KaleidoscopeJIT&quot;, *TheContext);
+  TheModule-&gt;setTargetTriple(TheJIT-&gt;getTargetTriple());
+  TheModule-&gt;setDataLayout(TheJIT-&gt;getDataLayout());
+
+  // Create a new builder for the module.
+  Builder = std::make_unique&lt;IRBuilder&lt;&gt;&gt;(*TheModule);
+
+  // Create new pass and analysis managers.
+  TheFPM = std::make_unique&lt;FunctionPassManager&gt;();
+  TheLAM = std::make_unique&lt;LoopAnalysisManager&gt;();
+  TheFAM = std::make_unique&lt;FunctionAnalysisManager&gt;();
+  TheCGAM = std::make_unique&lt;CGSCCAnalysisManager&gt;();
+  TheMAM = std::make_unique&lt;ModuleAnalysisManager&gt;();
+  ThePIC = std::make_unique&lt;PassInstrumentationCallbacks&gt;();
+  TheSI = std::make_unique&lt;StandardInstrumentations&gt;(*TheContext,
+                                                     /*DebugLogging*/ true);
+  TheSI-&gt;registerCallbacks(*ThePIC, TheMAM.get());
+
+  // Add transform passes.
+  // Do simple &quot;peephole&quot; optimizations and bit-twiddling optzns.
+  TheFPM-&gt;addPass(InstCombinePass());
+  // Reassociate expressions.
+  TheFPM-&gt;addPass(ReassociatePass());
+  // Eliminate Common SubExpressions.
+  TheFPM-&gt;addPass(GVNPass());
+  // Simplify the control flow graph (deleting unreachable blocks, etc).
+  TheFPM-&gt;addPass(SimplifyCFGPass());
+
+  // Register analysis passes used in these transform passes.
+  PassBuilder PB(*TheContext);
+  PB.registerModuleAnalyses(*TheMAM);
+  PB.registerFunctionAnalyses(*TheFAM);
+  PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
+}
+
+static void HandleDefinition() {
+  if (auto FnAST = ParseDefinition()) {
+    if (auto *FnIR = FnAST-&gt;codegen()) {
+      fprintf(stderr, &quot;Read function definition:&quot;);
+      FnIR-&gt;print(errs());
+      fprintf(stderr, &quot;\n&quot;);
+      ExitOnErr(TheJIT-&gt;addModule(
+          ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
+      InitializeModuleAndManagers();
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+static void HandleExtern() {
+  if (auto ProtoAST = ParseExtern()) {
+    if (auto *FnIR = ProtoAST-&gt;codegen()) {
+      fprintf(stderr, &quot;Read extern: &quot;);
+      FnIR-&gt;print(errs());
+      fprintf(stderr, &quot;\n&quot;);
+      FunctionProtos[ProtoAST-&gt;getName()] = std::move(ProtoAST);
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+static void HandleTopLevelExpression() {
+  // Evaluate a top-level expression into an anonymous function.
+  if (auto FnAST = ParseTopLevelExpr()) {
+    if (FnAST-&gt;codegen()) {
+      // Create a ResourceTracker to track JIT&#x27;d memory allocated to our
+      // anonymous expression -- that way we can free it after executing.
+      auto RT = TheJIT-&gt;getMainJITDylib().createResourceTracker();
+
+      auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+      ExitOnErr(TheJIT-&gt;addModule(std::move(TSM), RT));
+      InitializeModuleAndManagers();
+
+      // Search the JIT for the __anon_expr symbol.
+      auto ExprSymbol = ExitOnErr(TheJIT-&gt;lookup(&quot;__anon_expr&quot;));
+
+      // Get the symbol&#x27;s address and cast it to the right type (takes no
+      // arguments, returns a double) so we can call it as a native function.
+      double (*FP)() = ExprSymbol.toPtr&lt;double (*)()&gt;();
+      fprintf(stderr, &quot;Evaluated to %f\n&quot;, FP());
+
+      // Delete the anonymous expression module from the JIT.
+      ExitOnErr(RT-&gt;remove());
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+/// top ::= definition | external | expression | &#x27;;&#x27;
+static void MainLoop() {
+  while (true) {
+    fprintf(stderr, &quot;ready&gt; &quot;);
+    switch (CurTok) {
+    case tok_eof:
+      return;
+    case &#x27;;&#x27;: // ignore top-level semicolons.
+      getNextToken();
+      break;
+    case tok_def:
+      HandleDefinition();
+      break;
+    case tok_extern:
+      HandleExtern();
+      break;
+    default:
+      HandleTopLevelExpression();
+      break;
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// &quot;Library&quot; functions that can be &quot;extern&#x27;d&quot; from user code.
+//===----------------------------------------------------------------------===//
+
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+/// putchard - putchar that takes a double and returns 0.
+extern &quot;C&quot; DLLEXPORT double putchard(double X) {
+  fputc((char)X, stderr);
+  return 0;
+}
+
+/// printd - printf that takes a double prints it as &quot;%f\n&quot;, returning 0.
+extern &quot;C&quot; DLLEXPORT double printd(double X) {
+  fprintf(stderr, &quot;%f\n&quot;, X);
+  return 0;
+}
+
+//===----------------------------------------------------------------------===//
+// Main driver code.
+//===----------------------------------------------------------------------===//
+
+int main() {
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+
+  // Install standard binary operators.
+  // 1 is lowest precedence.
+  BinopPrecedence[&#x27;&lt;&#x27;] = 10;
+  BinopPrecedence[&#x27;+&#x27;] = 20;
+  BinopPrecedence[&#x27;-&#x27;] = 20;
+  BinopPrecedence[&#x27;*&#x27;] = 40; // highest.
+
+  // Prime the first token.
+  fprintf(stderr, &quot;ready&gt; &quot;);
+  getNextToken();
+
+  TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
+
+  InitializeModuleAndManagers();
+
+  // Run the main &quot;interpreter loop&quot; now.
+  MainLoop();
+
+  return 0;
+}
+</code></pre>
+<p>下一章：扩展语言——控制流</p><h2 id="references">原文参考链接</h2><ul><li><a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/index.html">Implementing a language with LLVM</a></li><li><a href="https://llvm.org/docs/WritingAnLLVMPass.html">How to Write a Pass</a></li><li><a href="https://llvm.org/docs/Passes.html">documentation about the various passes</a></li><li><a href="https://llvm.org/docs/WritingAnLLVMPass.html#what-passmanager-does">FunctionPassManager</a></li><li><a href="https://github.com/llvm/llvm-project/blob/main/llvm/examples/Kaleidoscope/include/KaleidoscopeJIT.h">llvm-src/examples/Kaleidoscope/include/KaleidoscopeJIT.h</a></li><li><a href="Kaleidoscope_Chapter5.html">Next: Extending the language: control flow</a></li></ul><footer>原文与示例代码版权归 LLVM Project 及其贡献者；许可及最新内容见 <a href="https://llvm.org/docs/">LLVM 官方文档</a>。中文翻译中标注的“译注”用于补充版本和语义说明。</footer></body></html>

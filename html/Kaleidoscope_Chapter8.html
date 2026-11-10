@@ -1,0 +1,1391 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LLVM Kaleidoscope 第 8 章：编译为目标文件（中文翻译）</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;line-height:1.85;color:#242a35;background:#fff;max-width:920px;margin:0 auto;padding:42px 25px}h1{font-size:2rem;line-height:1.4;margin-bottom:8px}h2{font-size:1.5rem;border-bottom:1px solid #dae0e6;padding:24px 0 10px;margin-top:38px}p{margin:17px 0;font-size:16px}pre{background:#f4f6f9;border:1px solid #e1e6eb;border-radius:0 0 9px 9px;padding:17px;overflow:auto;line-height:1.5;font-size:13px;tab-size:2;margin-top:0}code{font-family:Consolas,"DejaVu Sans Mono",monospace}.code-title{background:#e9edf3;border-radius:9px 9px 0 0;padding:4px 14px;font-size:12px;color:#526174;margin-top:20px}nav{display:flex;flex-wrap:wrap;gap:10px;margin:24px 0;padding:18px;background:#f5f7fa;border-radius:10px}nav a{color:#1656a5;text-decoration:none;font-size:14px}blockquote{border-left:3px solid #888;padding-left:15px}.note{color:#546170;font-size:14px}a{color:#1656a5}@media print{body{padding:0}pre{white-space:pre-wrap;word-wrap:break-word}section{break-inside:auto}}h3{margin-top:30px}img{max-width:100%;height:auto}footer{border-top:1px solid #dae0e6;margin-top:40px;padding-top:15px;font-size:13px;color:#546170}li{margin:8px 0}</style></head><body><h1 id="kaleidoscope-compiling-to-object-code">第八章：Kaleidoscope——编译为目标文件</h1><p class="note">根据 <a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl08.html">LLVM 官方第 8 章</a>翻译（原文获取日期：2026-11-10）。正文与各节说明译为中文；C++、LLVM IR、命令及输出完整保留原文。版式参考本项目第 3 章。原文可能使用比本项目 LLVM 18 更新的 API，应配合所安装版本的教程阅读；本页代码不是当前主程序已实现功能的声明。</p><nav aria-label="章节导航"><a href="index.html">目录</a><a href="Kaleidoscope_Chapter3.html">第 3 章：生成 LLVM IR</a><a href="Kaleidoscope_Chapter4.html">第 4 章：添加 JIT 和优化器支持</a><a href="Kaleidoscope_Chapter5.html">第 5 章：控制流</a><a href="Kaleidoscope_Chapter6.html">第 6 章：用户自定义运算符</a><a href="Kaleidoscope_Chapter7.html">第 7 章：可变变量</a><a href="Kaleidoscope_Chapter9.html">第 9 章：添加调试信息</a><a href="Kaleidoscope_Chapter10.html">第 10 章：总结与实用知识</a></nav><nav aria-label="本章目录"><a href="#chapter-8-introduction">8.1 第八章简介</a><a href="#choosing-a-target">8.2 选择目标</a><a href="#target-machine">8.3 目标机器</a><a href="#configuring-the-module">8.4 配置模块</a><a href="#emit-object-code">8.5 输出目标代码</a><a href="#putting-it-all-together">8.6 串联整个流程</a><a href="#full-code-listing">8.7 完整代码清单</a></nav><h2 id="chapter-8-introduction">8.1 第八章简介</h2>
+<p>欢迎来到《使用 LLVM 实现一门语言》第八章。本章介绍如何把语言编译为目标文件。</p>
+<h2 id="choosing-a-target">8.2 选择目标</h2>
+<p>LLVM 原生支持交叉编译，既可以为当前机器架构生成代码，也可以为其他架构生成代码。本章以当前机器为目标。</p>
+<p>使用称为“目标三元组”（target triple）的字符串指定目标，其形式为 &lt;arch&gt;&lt;sub&gt;-&lt;vendor&gt;-&lt;sys&gt;-&lt;abi&gt;。详细含义可参阅交叉编译文档。</p>
+<p>例如，可以查看 Clang 认为当前目标的三元组是什么：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>$ clang --version | grep Target
+Target: x86_64-unknown-linux-gnu
+</code></pre>
+<p>如果机器架构或操作系统不同，你看到的输出也可能不同。</p>
+<p>为本机生成代码时，无需硬编码目标三元组。LLVM 的 sys::getDefaultTargetTriple 会返回默认目标三元组。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>auto TargetTriple = sys::getDefaultTargetTriple();
+</code></pre>
+<p>LLVM 不要求链接所有目标相关功能。例如，只用 JIT 时不需要汇编打印器；只支持某些架构时，也可仅链接这些架构的组件。</p>
+<p>本例为了生成目标文件，初始化所有目标：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>InitializeAllTargetInfos();
+InitializeAllTargets();
+InitializeAllTargetMCs();
+InitializeAllAsmParsers();
+InitializeAllAsmPrinters();
+</code></pre>
+<p>然后根据目标三元组取得 Target：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>std::string Error;
+auto Target = TargetRegistry::lookupTarget(TargetTriple, Error);
+
+// Print an error and exit if we couldn&#x27;t find the requested target.
+// This generally occurs if we&#x27;ve forgotten to initialise the
+// TargetRegistry or we have a bogus target triple.
+if (!Target) {
+  errs() &lt;&lt; Error;
+  return 1;
+}
+</code></pre>
+<h2 id="target-machine">8.3 目标机器</h2>
+<p>还需要 TargetMachine，它提供目标机器的完整描述。若要指定某种指令特性，例如 SSE，或某款 CPU，就在这里设置。</p>
+<p>可以用 llc 查看 LLVM 支持的 CPU 与特性。例如查看 x86：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>$ llvm-as &lt; /dev/null | llc -march=x86 -mattr=help
+Available CPUs for this target:
+
+  amdfam10      - Select the amdfam10 processor.
+  athlon        - Select the athlon processor.
+  athlon-4      - Select the athlon-4 processor.
+  ...
+
+Available features for this target:
+
+  16bit-mode            - 16-bit mode (i8086).
+  32bit-mode            - 32-bit mode (80386).
+  3dnow                 - Enable 3DNow! instructions.
+  3dnowa                - Enable 3DNow! Athlon instructions.
+  ...
+</code></pre>
+<p>本例使用 generic CPU，不额外指定指令特性或目标选项。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>auto CPU = &quot;generic&quot;;
+auto Features = &quot;&quot;;
+
+TargetOptions opt;
+auto TargetMachine = Target-&gt;createTargetMachine(TargetTriple, CPU, Features, opt, Reloc::PIC_);
+</code></pre>
+<h2 id="configuring-the-module">8.4 配置模块</h2>
+<p>现在给模块设置目标和数据布局。前端性能指南建议这么做，因为优化器可以利用这些信息。原文说明这并非严格必需。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>TheModule-&gt;setDataLayout(TargetMachine-&gt;getTargetTriple().computeDataLayout());
+TheModule-&gt;setTargetTriple(TargetTriple);
+</code></pre>
+<h2 id="emit-object-code">8.5 输出目标代码</h2>
+<p>准备输出目标文件，先指定文件路径：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>auto Filename = &quot;output.o&quot;;
+std::error_code EC;
+raw_fd_ostream dest(Filename, EC, sys::fs::OF_None);
+
+if (EC) {
+  errs() &lt;&lt; &quot;Could not open file: &quot; &lt;&lt; EC.message();
+  return 1;
+}
+</code></pre>
+<p>最后配置负责生成目标文件的 pass，并执行：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>legacy::PassManager pass;
+auto FileType = CodeGenFileType::ObjectFile;
+
+if (TargetMachine-&gt;addPassesToEmitFile(pass, dest, nullptr, FileType)) {
+  errs() &lt;&lt; &quot;TargetMachine can&#x27;t emit a file of this type&quot;;
+  return 1;
+}
+
+pass.run(*TheModule);
+dest.flush();
+</code></pre>
+<h2 id="putting-it-all-together">8.6 串联整个流程</h2>
+<p>试着运行一下。先编译代码，注意这里传给 llvm-config 的参数与前几章不同。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>$ clang++ -g -O3 toy.cpp `llvm-config --cxxflags --ldflags --system-libs --libs all` -o toy
+</code></pre>
+<p>运行程序，定义一个简单的平均值函数，完成输入后按 Ctrl+D。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>$ ./toy
+ready&gt; def average(x y) (x + y) * 0.5;
+^D
+Wrote output.o
+</code></pre>
+<p>现在已经生成目标文件。编写一个简单程序与它链接，测试结果；源码如下：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>#include &lt;iostream&gt;
+
+extern &quot;C&quot; {
+    double average(double, double);
+}
+
+int main() {
+    std::cout &lt;&lt; &quot;average of 3.0 and 4.0: &quot; &lt;&lt; average(3.0, 4.0) &lt;&lt; std::endl;
+}
+</code></pre>
+<p>将程序与 output.o 链接，检查输出是否符合预期：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>$ clang++ main.cpp output.o -o main
+$ ./main
+average of 3.0 and 4.0: 3.5
+</code></pre>
+<h2 id="full-code-listing">8.7 完整代码清单</h2>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>#include &quot;llvm/ADT/APFloat.h&quot;
+#include &quot;llvm/ADT/STLExtras.h&quot;
+#include &quot;llvm/IR/BasicBlock.h&quot;
+#include &quot;llvm/IR/Constants.h&quot;
+#include &quot;llvm/IR/DerivedTypes.h&quot;
+#include &quot;llvm/IR/Function.h&quot;
+#include &quot;llvm/IR/IRBuilder.h&quot;
+#include &quot;llvm/IR/Instructions.h&quot;
+#include &quot;llvm/IR/LLVMContext.h&quot;
+#include &quot;llvm/IR/LegacyPassManager.h&quot;
+#include &quot;llvm/IR/Module.h&quot;
+#include &quot;llvm/IR/Type.h&quot;
+#include &quot;llvm/IR/Verifier.h&quot;
+#include &quot;llvm/MC/TargetRegistry.h&quot;
+#include &quot;llvm/Support/FileSystem.h&quot;
+#include &quot;llvm/Support/TargetSelect.h&quot;
+#include &quot;llvm/Support/raw_ostream.h&quot;
+#include &quot;llvm/Target/TargetMachine.h&quot;
+#include &quot;llvm/Target/TargetOptions.h&quot;
+#include &quot;llvm/TargetParser/Host.h&quot;
+#include &lt;algorithm&gt;
+#include &lt;cassert&gt;
+#include &lt;cctype&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;string&gt;
+#include &lt;system_error&gt;
+#include &lt;utility&gt;
+#include &lt;vector&gt;
+
+using namespace llvm;
+using namespace llvm::sys;
+
+//===----------------------------------------------------------------------===//
+// Lexer
+//===----------------------------------------------------------------------===//
+
+// The lexer returns tokens [0-255] if it is an unknown character, otherwise one
+// of these for known things.
+enum Token {
+  tok_eof = -1,
+
+  // commands
+  tok_def = -2,
+  tok_extern = -3,
+
+  // primary
+  tok_identifier = -4,
+  tok_number = -5,
+
+  // control
+  tok_if = -6,
+  tok_then = -7,
+  tok_else = -8,
+  tok_for = -9,
+  tok_in = -10,
+
+  // operators
+  tok_binary = -11,
+  tok_unary = -12,
+
+  // var definition
+  tok_var = -13
+};
+
+static std::string IdentifierStr; // Filled in if tok_identifier
+static double NumVal;             // Filled in if tok_number
+
+/// gettok - Return the next token from standard input.
+static int gettok() {
+  static int LastChar = &#x27; &#x27;;
+
+  // Skip any whitespace.
+  while (isspace(LastChar))
+    LastChar = getchar();
+
+  if (isalpha(LastChar)) { // identifier: [a-zA-Z][a-zA-Z0-9]*
+    IdentifierStr = LastChar;
+    while (isalnum((LastChar = getchar())))
+      IdentifierStr += LastChar;
+
+    if (IdentifierStr == &quot;def&quot;)
+      return tok_def;
+    if (IdentifierStr == &quot;extern&quot;)
+      return tok_extern;
+    if (IdentifierStr == &quot;if&quot;)
+      return tok_if;
+    if (IdentifierStr == &quot;then&quot;)
+      return tok_then;
+    if (IdentifierStr == &quot;else&quot;)
+      return tok_else;
+    if (IdentifierStr == &quot;for&quot;)
+      return tok_for;
+    if (IdentifierStr == &quot;in&quot;)
+      return tok_in;
+    if (IdentifierStr == &quot;binary&quot;)
+      return tok_binary;
+    if (IdentifierStr == &quot;unary&quot;)
+      return tok_unary;
+    if (IdentifierStr == &quot;var&quot;)
+      return tok_var;
+    return tok_identifier;
+  }
+
+  if (isdigit(LastChar) || LastChar == &#x27;.&#x27;) { // Number: [0-9.]+
+    std::string NumStr;
+    do {
+      NumStr += LastChar;
+      LastChar = getchar();
+    } while (isdigit(LastChar) || LastChar == &#x27;.&#x27;);
+
+    NumVal = strtod(NumStr.c_str(), nullptr);
+    return tok_number;
+  }
+
+  if (LastChar == &#x27;#&#x27;) {
+    // Comment until end of line.
+    do
+      LastChar = getchar();
+    while (LastChar != EOF &amp;&amp; LastChar != &#x27;\n&#x27; &amp;&amp; LastChar != &#x27;\r&#x27;);
+
+    if (LastChar != EOF)
+      return gettok();
+  }
+
+  // Check for end of file.  Don&#x27;t eat the EOF.
+  if (LastChar == EOF)
+    return tok_eof;
+
+  // Otherwise, just return the character as its ascii value.
+  int ThisChar = LastChar;
+  LastChar = getchar();
+  return ThisChar;
+}
+
+//===----------------------------------------------------------------------===//
+// Abstract Syntax Tree (aka Parse Tree)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// ExprAST - Base class for all expression nodes.
+class ExprAST {
+public:
+  virtual ~ExprAST() = default;
+
+  virtual Value *codegen() = 0;
+};
+
+/// NumberExprAST - Expression class for numeric literals like &quot;1.0&quot;.
+class NumberExprAST : public ExprAST {
+  double Val;
+
+public:
+  NumberExprAST(double Val) : Val(Val) {}
+
+  Value *codegen() override;
+};
+
+/// VariableExprAST - Expression class for referencing a variable, like &quot;a&quot;.
+class VariableExprAST : public ExprAST {
+  std::string Name;
+
+public:
+  VariableExprAST(const std::string &amp;Name) : Name(Name) {}
+
+  Value *codegen() override;
+  const std::string &amp;getName() const { return Name; }
+};
+
+/// UnaryExprAST - Expression class for a unary operator.
+class UnaryExprAST : public ExprAST {
+  char Opcode;
+  std::unique_ptr&lt;ExprAST&gt; Operand;
+
+public:
+  UnaryExprAST(char Opcode, std::unique_ptr&lt;ExprAST&gt; Operand)
+      : Opcode(Opcode), Operand(std::move(Operand)) {}
+
+  Value *codegen() override;
+};
+
+/// BinaryExprAST - Expression class for a binary operator.
+class BinaryExprAST : public ExprAST {
+  char Op;
+  std::unique_ptr&lt;ExprAST&gt; LHS, RHS;
+
+public:
+  BinaryExprAST(char Op, std::unique_ptr&lt;ExprAST&gt; LHS,
+                std::unique_ptr&lt;ExprAST&gt; RHS)
+      : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+
+  Value *codegen() override;
+};
+
+/// CallExprAST - Expression class for function calls.
+class CallExprAST : public ExprAST {
+  std::string Callee;
+  std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args;
+
+public:
+  CallExprAST(const std::string &amp;Callee,
+              std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args)
+      : Callee(Callee), Args(std::move(Args)) {}
+
+  Value *codegen() override;
+};
+
+/// IfExprAST - Expression class for if/then/else.
+class IfExprAST : public ExprAST {
+  std::unique_ptr&lt;ExprAST&gt; Cond, Then, Else;
+
+public:
+  IfExprAST(std::unique_ptr&lt;ExprAST&gt; Cond, std::unique_ptr&lt;ExprAST&gt; Then,
+            std::unique_ptr&lt;ExprAST&gt; Else)
+      : Cond(std::move(Cond)), Then(std::move(Then)), Else(std::move(Else)) {}
+
+  Value *codegen() override;
+};
+
+/// ForExprAST - Expression class for for/in.
+class ForExprAST : public ExprAST {
+  std::string VarName;
+  std::unique_ptr&lt;ExprAST&gt; Start, End, Step, Body;
+
+public:
+  ForExprAST(const std::string &amp;VarName, std::unique_ptr&lt;ExprAST&gt; Start,
+             std::unique_ptr&lt;ExprAST&gt; End, std::unique_ptr&lt;ExprAST&gt; Step,
+             std::unique_ptr&lt;ExprAST&gt; Body)
+      : VarName(VarName), Start(std::move(Start)), End(std::move(End)),
+        Step(std::move(Step)), Body(std::move(Body)) {}
+
+  Value *codegen() override;
+};
+
+/// VarExprAST - Expression class for var/in
+class VarExprAST : public ExprAST {
+  std::vector&lt;std::pair&lt;std::string, std::unique_ptr&lt;ExprAST&gt;&gt;&gt; VarNames;
+  std::unique_ptr&lt;ExprAST&gt; Body;
+
+public:
+  VarExprAST(
+      std::vector&lt;std::pair&lt;std::string, std::unique_ptr&lt;ExprAST&gt;&gt;&gt; VarNames,
+      std::unique_ptr&lt;ExprAST&gt; Body)
+      : VarNames(std::move(VarNames)), Body(std::move(Body)) {}
+
+  Value *codegen() override;
+};
+
+/// PrototypeAST - This class represents the &quot;prototype&quot; for a function,
+/// which captures its name, and its argument names (thus implicitly the number
+/// of arguments the function takes), as well as if it is an operator.
+class PrototypeAST {
+  std::string Name;
+  std::vector&lt;std::string&gt; Args;
+  bool IsOperator;
+  unsigned Precedence; // Precedence if a binary op.
+
+public:
+  PrototypeAST(const std::string &amp;Name, std::vector&lt;std::string&gt; Args,
+               bool IsOperator = false, unsigned Prec = 0)
+      : Name(Name), Args(std::move(Args)), IsOperator(IsOperator),
+        Precedence(Prec) {}
+
+  Function *codegen();
+  const std::string &amp;getName() const { return Name; }
+
+  bool isUnaryOp() const { return IsOperator &amp;&amp; Args.size() == 1; }
+  bool isBinaryOp() const { return IsOperator &amp;&amp; Args.size() == 2; }
+
+  char getOperatorName() const {
+    assert(isUnaryOp() || isBinaryOp());
+    return Name[Name.size() - 1];
+  }
+
+  unsigned getBinaryPrecedence() const { return Precedence; }
+};
+
+/// FunctionAST - This class represents a function definition itself.
+class FunctionAST {
+  std::unique_ptr&lt;PrototypeAST&gt; Proto;
+  std::unique_ptr&lt;ExprAST&gt; Body;
+
+public:
+  FunctionAST(std::unique_ptr&lt;PrototypeAST&gt; Proto,
+              std::unique_ptr&lt;ExprAST&gt; Body)
+      : Proto(std::move(Proto)), Body(std::move(Body)) {}
+
+  Function *codegen();
+};
+
+} // end anonymous namespace
+
+//===----------------------------------------------------------------------===//
+// Parser
+//===----------------------------------------------------------------------===//
+
+/// CurTok/getNextToken - Provide a simple token buffer.  CurTok is the current
+/// token the parser is looking at.  getNextToken reads another token from the
+/// lexer and updates CurTok with its results.
+static int CurTok;
+static int getNextToken() { return CurTok = gettok(); }
+
+/// BinopPrecedence - This holds the precedence for each binary operator that is
+/// defined.
+static std::map&lt;char, int&gt; BinopPrecedence;
+
+/// GetTokPrecedence - Get the precedence of the pending binary operator token.
+static int GetTokPrecedence() {
+  if (!isascii(CurTok))
+    return -1;
+
+  // Make sure it&#x27;s a declared binop.
+  int TokPrec = BinopPrecedence[CurTok];
+  if (TokPrec &lt;= 0)
+    return -1;
+  return TokPrec;
+}
+
+/// LogError* - These are little helper functions for error handling.
+std::unique_ptr&lt;ExprAST&gt; LogError(const char *Str) {
+  fprintf(stderr, &quot;Error: %s\n&quot;, Str);
+  return nullptr;
+}
+
+std::unique_ptr&lt;PrototypeAST&gt; LogErrorP(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+static std::unique_ptr&lt;ExprAST&gt; ParseExpression();
+
+/// numberexpr ::= number
+static std::unique_ptr&lt;ExprAST&gt; ParseNumberExpr() {
+  auto Result = std::make_unique&lt;NumberExprAST&gt;(NumVal);
+  getNextToken(); // consume the number
+  return std::move(Result);
+}
+
+/// parenexpr ::= &#x27;(&#x27; expression &#x27;)&#x27;
+static std::unique_ptr&lt;ExprAST&gt; ParseParenExpr() {
+  getNextToken(); // eat (.
+  auto V = ParseExpression();
+  if (!V)
+    return nullptr;
+
+  if (CurTok != &#x27;)&#x27;)
+    return LogError(&quot;expected &#x27;)&#x27;&quot;);
+  getNextToken(); // eat ).
+  return V;
+}
+
+/// identifierexpr
+///   ::= identifier
+///   ::= identifier &#x27;(&#x27; expression* &#x27;)&#x27;
+static std::unique_ptr&lt;ExprAST&gt; ParseIdentifierExpr() {
+  std::string IdName = IdentifierStr;
+
+  getNextToken(); // eat identifier.
+
+  if (CurTok != &#x27;(&#x27;) // Simple variable ref.
+    return std::make_unique&lt;VariableExprAST&gt;(IdName);
+
+  // Call.
+  getNextToken(); // eat (
+  std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args;
+  if (CurTok != &#x27;)&#x27;) {
+    while (true) {
+      if (auto Arg = ParseExpression())
+        Args.push_back(std::move(Arg));
+      else
+        return nullptr;
+
+      if (CurTok == &#x27;)&#x27;)
+        break;
+
+      if (CurTok != &#x27;,&#x27;)
+        return LogError(&quot;Expected &#x27;)&#x27; or &#x27;,&#x27; in argument list&quot;);
+      getNextToken();
+    }
+  }
+
+  // Eat the &#x27;)&#x27;.
+  getNextToken();
+
+  return std::make_unique&lt;CallExprAST&gt;(IdName, std::move(Args));
+}
+
+/// ifexpr ::= &#x27;if&#x27; expression &#x27;then&#x27; expression &#x27;else&#x27; expression
+static std::unique_ptr&lt;ExprAST&gt; ParseIfExpr() {
+  getNextToken(); // eat the if.
+
+  // condition.
+  auto Cond = ParseExpression();
+  if (!Cond)
+    return nullptr;
+
+  if (CurTok != tok_then)
+    return LogError(&quot;expected then&quot;);
+  getNextToken(); // eat the then
+
+  auto Then = ParseExpression();
+  if (!Then)
+    return nullptr;
+
+  if (CurTok != tok_else)
+    return LogError(&quot;expected else&quot;);
+
+  getNextToken();
+
+  auto Else = ParseExpression();
+  if (!Else)
+    return nullptr;
+
+  return std::make_unique&lt;IfExprAST&gt;(std::move(Cond), std::move(Then),
+                                      std::move(Else));
+}
+
+/// forexpr ::= &#x27;for&#x27; identifier &#x27;=&#x27; expr &#x27;,&#x27; expr (&#x27;,&#x27; expr)? &#x27;in&#x27; expression
+static std::unique_ptr&lt;ExprAST&gt; ParseForExpr() {
+  getNextToken(); // eat the for.
+
+  if (CurTok != tok_identifier)
+    return LogError(&quot;expected identifier after for&quot;);
+
+  std::string IdName = IdentifierStr;
+  getNextToken(); // eat identifier.
+
+  if (CurTok != &#x27;=&#x27;)
+    return LogError(&quot;expected &#x27;=&#x27; after for&quot;);
+  getNextToken(); // eat &#x27;=&#x27;.
+
+  auto Start = ParseExpression();
+  if (!Start)
+    return nullptr;
+  if (CurTok != &#x27;,&#x27;)
+    return LogError(&quot;expected &#x27;,&#x27; after for start value&quot;);
+  getNextToken();
+
+  auto End = ParseExpression();
+  if (!End)
+    return nullptr;
+
+  // The step value is optional.
+  std::unique_ptr&lt;ExprAST&gt; Step;
+  if (CurTok == &#x27;,&#x27;) {
+    getNextToken();
+    Step = ParseExpression();
+    if (!Step)
+      return nullptr;
+  }
+
+  if (CurTok != tok_in)
+    return LogError(&quot;expected &#x27;in&#x27; after for&quot;);
+  getNextToken(); // eat &#x27;in&#x27;.
+
+  auto Body = ParseExpression();
+  if (!Body)
+    return nullptr;
+
+  return std::make_unique&lt;ForExprAST&gt;(IdName, std::move(Start), std::move(End),
+                                       std::move(Step), std::move(Body));
+}
+
+/// varexpr ::= &#x27;var&#x27; identifier (&#x27;=&#x27; expression)?
+//                    (&#x27;,&#x27; identifier (&#x27;=&#x27; expression)?)* &#x27;in&#x27; expression
+static std::unique_ptr&lt;ExprAST&gt; ParseVarExpr() {
+  getNextToken(); // eat the var.
+
+  std::vector&lt;std::pair&lt;std::string, std::unique_ptr&lt;ExprAST&gt;&gt;&gt; VarNames;
+
+  // At least one variable name is required.
+  if (CurTok != tok_identifier)
+    return LogError(&quot;expected identifier after var&quot;);
+
+  while (true) {
+    std::string Name = IdentifierStr;
+    getNextToken(); // eat identifier.
+
+    // Read the optional initializer.
+    std::unique_ptr&lt;ExprAST&gt; Init = nullptr;
+    if (CurTok == &#x27;=&#x27;) {
+      getNextToken(); // eat the &#x27;=&#x27;.
+
+      Init = ParseExpression();
+      if (!Init)
+        return nullptr;
+    }
+
+    VarNames.push_back(std::make_pair(Name, std::move(Init)));
+
+    // End of var list, exit loop.
+    if (CurTok != &#x27;,&#x27;)
+      break;
+    getNextToken(); // eat the &#x27;,&#x27;.
+
+    if (CurTok != tok_identifier)
+      return LogError(&quot;expected identifier list after var&quot;);
+  }
+
+  // At this point, we have to have &#x27;in&#x27;.
+  if (CurTok != tok_in)
+    return LogError(&quot;expected &#x27;in&#x27; keyword after &#x27;var&#x27;&quot;);
+  getNextToken(); // eat &#x27;in&#x27;.
+
+  auto Body = ParseExpression();
+  if (!Body)
+    return nullptr;
+
+  return std::make_unique&lt;VarExprAST&gt;(std::move(VarNames), std::move(Body));
+}
+
+/// primary
+///   ::= identifierexpr
+///   ::= numberexpr
+///   ::= parenexpr
+///   ::= ifexpr
+///   ::= forexpr
+///   ::= varexpr
+static std::unique_ptr&lt;ExprAST&gt; ParsePrimary() {
+  switch (CurTok) {
+  default:
+    return LogError(&quot;unknown token when expecting an expression&quot;);
+  case tok_identifier:
+    return ParseIdentifierExpr();
+  case tok_number:
+    return ParseNumberExpr();
+  case &#x27;(&#x27;:
+    return ParseParenExpr();
+  case tok_if:
+    return ParseIfExpr();
+  case tok_for:
+    return ParseForExpr();
+  case tok_var:
+    return ParseVarExpr();
+  }
+}
+
+/// unary
+///   ::= primary
+///   ::= &#x27;!&#x27; unary
+static std::unique_ptr&lt;ExprAST&gt; ParseUnary() {
+  // If the current token is not an operator, it must be a primary expr.
+  if (!isascii(CurTok) || CurTok == &#x27;(&#x27; || CurTok == &#x27;,&#x27;)
+    return ParsePrimary();
+
+  // If this is a unary operator, read it.
+  int Opc = CurTok;
+  getNextToken();
+  if (auto Operand = ParseUnary())
+    return std::make_unique&lt;UnaryExprAST&gt;(Opc, std::move(Operand));
+  return nullptr;
+}
+
+/// binoprhs
+///   ::= (&#x27;+&#x27; unary)*
+static std::unique_ptr&lt;ExprAST&gt; ParseBinOpRHS(int ExprPrec,
+                                              std::unique_ptr&lt;ExprAST&gt; LHS) {
+  // If this is a binop, find its precedence.
+  while (true) {
+    int TokPrec = GetTokPrecedence();
+
+    // If this is a binop that binds at least as tightly as the current binop,
+    // consume it, otherwise we are done.
+    if (TokPrec &lt; ExprPrec)
+      return LHS;
+
+    // Okay, we know this is a binop.
+    int BinOp = CurTok;
+    getNextToken(); // eat binop
+
+    // Parse the unary expression after the binary operator.
+    auto RHS = ParseUnary();
+    if (!RHS)
+      return nullptr;
+
+    // If BinOp binds less tightly with RHS than the operator after RHS, let
+    // the pending operator take RHS as its LHS.
+    int NextPrec = GetTokPrecedence();
+    if (TokPrec &lt; NextPrec) {
+      RHS = ParseBinOpRHS(TokPrec + 1, std::move(RHS));
+      if (!RHS)
+        return nullptr;
+    }
+
+    // Merge LHS/RHS.
+    LHS =
+        std::make_unique&lt;BinaryExprAST&gt;(BinOp, std::move(LHS), std::move(RHS));
+  }
+}
+
+/// expression
+///   ::= unary binoprhs
+///
+static std::unique_ptr&lt;ExprAST&gt; ParseExpression() {
+  auto LHS = ParseUnary();
+  if (!LHS)
+    return nullptr;
+
+  return ParseBinOpRHS(0, std::move(LHS));
+}
+
+/// prototype
+///   ::= id &#x27;(&#x27; id* &#x27;)&#x27;
+///   ::= binary LETTER number? (id, id)
+///   ::= unary LETTER (id)
+static std::unique_ptr&lt;PrototypeAST&gt; ParsePrototype() {
+  std::string FnName;
+
+  unsigned Kind = 0; // 0 = identifier, 1 = unary, 2 = binary.
+  unsigned BinaryPrecedence = 30;
+
+  switch (CurTok) {
+  default:
+    return LogErrorP(&quot;Expected function name in prototype&quot;);
+  case tok_identifier:
+    FnName = IdentifierStr;
+    Kind = 0;
+    getNextToken();
+    break;
+  case tok_unary:
+    getNextToken();
+    if (!isascii(CurTok))
+      return LogErrorP(&quot;Expected unary operator&quot;);
+    FnName = &quot;unary&quot;;
+    FnName += (char)CurTok;
+    Kind = 1;
+    getNextToken();
+    break;
+  case tok_binary:
+    getNextToken();
+    if (!isascii(CurTok))
+      return LogErrorP(&quot;Expected binary operator&quot;);
+    FnName = &quot;binary&quot;;
+    FnName += (char)CurTok;
+    Kind = 2;
+    getNextToken();
+
+    // Read the precedence if present.
+    if (CurTok == tok_number) {
+      if (NumVal &lt; 1 || NumVal &gt; 100)
+        return LogErrorP(&quot;Invalid precedence: must be 1..100&quot;);
+      BinaryPrecedence = (unsigned)NumVal;
+      getNextToken();
+    }
+    break;
+  }
+
+  if (CurTok != &#x27;(&#x27;)
+    return LogErrorP(&quot;Expected &#x27;(&#x27; in prototype&quot;);
+
+  std::vector&lt;std::string&gt; ArgNames;
+  while (getNextToken() == tok_identifier)
+    ArgNames.push_back(IdentifierStr);
+  if (CurTok != &#x27;)&#x27;)
+    return LogErrorP(&quot;Expected &#x27;)&#x27; in prototype&quot;);
+
+  // success.
+  getNextToken(); // eat &#x27;)&#x27;.
+
+  // Verify right number of names for operator.
+  if (Kind &amp;&amp; ArgNames.size() != Kind)
+    return LogErrorP(&quot;Invalid number of operands for operator&quot;);
+
+  return std::make_unique&lt;PrototypeAST&gt;(FnName, ArgNames, Kind != 0,
+                                         BinaryPrecedence);
+}
+
+/// definition ::= &#x27;def&#x27; prototype expression
+static std::unique_ptr&lt;FunctionAST&gt; ParseDefinition() {
+  getNextToken(); // eat def.
+  auto Proto = ParsePrototype();
+  if (!Proto)
+    return nullptr;
+
+  if (auto E = ParseExpression())
+    return std::make_unique&lt;FunctionAST&gt;(std::move(Proto), std::move(E));
+  return nullptr;
+}
+
+/// toplevelexpr ::= expression
+static std::unique_ptr&lt;FunctionAST&gt; ParseTopLevelExpr() {
+  if (auto E = ParseExpression()) {
+    // Make an anonymous proto.
+    auto Proto = std::make_unique&lt;PrototypeAST&gt;(&quot;__anon_expr&quot;,
+                                                 std::vector&lt;std::string&gt;());
+    return std::make_unique&lt;FunctionAST&gt;(std::move(Proto), std::move(E));
+  }
+  return nullptr;
+}
+
+/// external ::= &#x27;extern&#x27; prototype
+static std::unique_ptr&lt;PrototypeAST&gt; ParseExtern() {
+  getNextToken(); // eat extern.
+  return ParsePrototype();
+}
+
+//===----------------------------------------------------------------------===//
+// Code Generation
+//===----------------------------------------------------------------------===//
+
+static std::unique_ptr&lt;LLVMContext&gt; TheContext;
+static std::unique_ptr&lt;Module&gt; TheModule;
+static std::unique_ptr&lt;IRBuilder&lt;&gt;&gt; Builder;
+static std::map&lt;std::string, AllocaInst *&gt; NamedValues;
+static std::map&lt;std::string, std::unique_ptr&lt;PrototypeAST&gt;&gt; FunctionProtos;
+static ExitOnError ExitOnErr;
+
+Value *LogErrorV(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+Function *getFunction(std::string Name) {
+  // First, see if the function has already been added to the current module.
+  if (auto *F = TheModule-&gt;getFunction(Name))
+    return F;
+
+  // If not, check whether we can codegen the declaration from some existing
+  // prototype.
+  auto FI = FunctionProtos.find(Name);
+  if (FI != FunctionProtos.end())
+    return FI-&gt;second-&gt;codegen();
+
+  // If no existing prototype exists, return null.
+  return nullptr;
+}
+
+/// CreateEntryBlockAlloca - Create an alloca instruction in the entry block of
+/// the function.  This is used for mutable variables etc.
+static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction,
+                                          StringRef VarName) {
+  IRBuilder&lt;&gt; TmpB(TheFunction-&gt;getEntryBlock().begin());
+  return TmpB.CreateAlloca(Type::getDoubleTy(*TheContext), nullptr, VarName);
+}
+
+Value *NumberExprAST::codegen() {
+  return ConstantFP::get(*TheContext, APFloat(Val));
+}
+
+Value *VariableExprAST::codegen() {
+  // Look this variable up in the function.
+  Value *V = NamedValues[Name];
+  if (!V)
+    return LogErrorV(&quot;Unknown variable name&quot;);
+
+  // Load the value.
+  return Builder-&gt;CreateLoad(Type::getDoubleTy(*TheContext), V, Name.c_str());
+}
+
+Value *UnaryExprAST::codegen() {
+  Value *OperandV = Operand-&gt;codegen();
+  if (!OperandV)
+    return nullptr;
+
+  Function *F = getFunction(std::string(&quot;unary&quot;) + Opcode);
+  if (!F)
+    return LogErrorV(&quot;Unknown unary operator&quot;);
+
+  return Builder-&gt;CreateCall(F, OperandV, &quot;unop&quot;);
+}
+
+Value *BinaryExprAST::codegen() {
+  // Special case &#x27;=&#x27; because we don&#x27;t want to emit the LHS as an expression.
+  if (Op == &#x27;=&#x27;) {
+    // Assignment requires the LHS to be an identifier.
+    // This assume we&#x27;re building without RTTI because LLVM builds that way by
+    // default.  If you build LLVM with RTTI this can be changed to a
+    // dynamic_cast for automatic error checking.
+    VariableExprAST *LHSE = static_cast&lt;VariableExprAST *&gt;(LHS.get());
+    if (!LHSE)
+      return LogErrorV(&quot;destination of &#x27;=&#x27; must be a variable&quot;);
+    // Codegen the RHS.
+    Value *Val = RHS-&gt;codegen();
+    if (!Val)
+      return nullptr;
+
+    // Look up the name.
+    Value *Variable = NamedValues[LHSE-&gt;getName()];
+    if (!Variable)
+      return LogErrorV(&quot;Unknown variable name&quot;);
+
+    Builder-&gt;CreateStore(Val, Variable);
+    return Val;
+  }
+
+  Value *L = LHS-&gt;codegen();
+  Value *R = RHS-&gt;codegen();
+  if (!L || !R)
+    return nullptr;
+
+  switch (Op) {
+  case &#x27;+&#x27;:
+    return Builder-&gt;CreateFAdd(L, R, &quot;addtmp&quot;);
+  case &#x27;-&#x27;:
+    return Builder-&gt;CreateFSub(L, R, &quot;subtmp&quot;);
+  case &#x27;*&#x27;:
+    return Builder-&gt;CreateFMul(L, R, &quot;multmp&quot;);
+  case &#x27;&lt;&#x27;:
+    L = Builder-&gt;CreateFCmpULT(L, R, &quot;cmptmp&quot;);
+    // Convert bool 0/1 to double 0.0 or 1.0
+    return Builder-&gt;CreateUIToFP(L, Type::getDoubleTy(*TheContext), &quot;booltmp&quot;);
+  default:
+    break;
+  }
+
+  // If it wasn&#x27;t a builtin binary operator, it must be a user defined one. Emit
+  // a call to it.
+  Function *F = getFunction(std::string(&quot;binary&quot;) + Op);
+  assert(F &amp;&amp; &quot;binary operator not found!&quot;);
+
+  Value *Ops[] = {L, R};
+  return Builder-&gt;CreateCall(F, Ops, &quot;binop&quot;);
+}
+
+Value *CallExprAST::codegen() {
+  // Look up the name in the global module table.
+  Function *CalleeF = getFunction(Callee);
+  if (!CalleeF)
+    return LogErrorV(&quot;Unknown function referenced&quot;);
+
+  // If argument mismatch error.
+  if (CalleeF-&gt;arg_size() != Args.size())
+    return LogErrorV(&quot;Incorrect # arguments passed&quot;);
+
+  std::vector&lt;Value *&gt; ArgsV;
+  for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+    ArgsV.push_back(Args[i]-&gt;codegen());
+    if (!ArgsV.back())
+      return nullptr;
+  }
+
+  return Builder-&gt;CreateCall(CalleeF, ArgsV, &quot;calltmp&quot;);
+}
+
+Value *IfExprAST::codegen() {
+  Value *CondV = Cond-&gt;codegen();
+  if (!CondV)
+    return nullptr;
+
+  // Convert condition to a bool by comparing non-equal to 0.0.
+  CondV = Builder-&gt;CreateFCmpONE(
+      CondV, ConstantFP::get(*TheContext, APFloat(0.0)), &quot;ifcond&quot;);
+
+  Function *TheFunction = Builder-&gt;GetInsertBlock()-&gt;getParent();
+
+  // Create blocks for the then and else cases.  Insert the &#x27;then&#x27; block at the
+  // end of the function.
+  BasicBlock *ThenBB = BasicBlock::Create(*TheContext, &quot;then&quot;, TheFunction);
+  BasicBlock *ElseBB = BasicBlock::Create(*TheContext, &quot;else&quot;);
+  BasicBlock *MergeBB = BasicBlock::Create(*TheContext, &quot;ifcont&quot;);
+
+  Builder-&gt;CreateCondBr(CondV, ThenBB, ElseBB);
+
+  // Emit then value.
+  Builder-&gt;SetInsertPoint(ThenBB);
+
+  Value *ThenV = Then-&gt;codegen();
+  if (!ThenV)
+    return nullptr;
+
+  Builder-&gt;CreateBr(MergeBB);
+  // Codegen of &#x27;Then&#x27; can change the current block, update ThenBB for the PHI.
+  ThenBB = Builder-&gt;GetInsertBlock();
+
+  // Emit else block.
+  TheFunction-&gt;insert(TheFunction-&gt;end(), ElseBB);
+  Builder-&gt;SetInsertPoint(ElseBB);
+
+  Value *ElseV = Else-&gt;codegen();
+  if (!ElseV)
+    return nullptr;
+
+  Builder-&gt;CreateBr(MergeBB);
+  // Codegen of &#x27;Else&#x27; can change the current block, update ElseBB for the PHI.
+  ElseBB = Builder-&gt;GetInsertBlock();
+
+  // Emit merge block.
+  TheFunction-&gt;insert(TheFunction-&gt;end(), MergeBB);
+  Builder-&gt;SetInsertPoint(MergeBB);
+  PHINode *PN = Builder-&gt;CreatePHI(Type::getDoubleTy(*TheContext), 2, &quot;iftmp&quot;);
+
+  PN-&gt;addIncoming(ThenV, ThenBB);
+  PN-&gt;addIncoming(ElseV, ElseBB);
+  return PN;
+}
+
+// Output for-loop as:
+//   var = alloca double
+//   ...
+//   start = startexpr
+//   store start -&gt; var
+//   goto loop
+// loop:
+//   ...
+//   bodyexpr
+//   ...
+// loopend:
+//   step = stepexpr
+//   endcond = endexpr
+//
+//   curvar = load var
+//   nextvar = curvar + step
+//   store nextvar -&gt; var
+//   br endcond, loop, endloop
+// outloop:
+Value *ForExprAST::codegen() {
+  Function *TheFunction = Builder-&gt;GetInsertBlock()-&gt;getParent();
+
+  // Create an alloca for the variable in the entry block.
+  AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+
+  // Emit the start code first, without &#x27;variable&#x27; in scope.
+  Value *StartVal = Start-&gt;codegen();
+  if (!StartVal)
+    return nullptr;
+
+  // Store the value into the alloca.
+  Builder-&gt;CreateStore(StartVal, Alloca);
+
+  // Make the new basic block for the loop header, inserting after current
+  // block.
+  BasicBlock *LoopBB = BasicBlock::Create(*TheContext, &quot;loop&quot;, TheFunction);
+
+  // Insert an explicit fall through from the current block to the LoopBB.
+  Builder-&gt;CreateBr(LoopBB);
+
+  // Start insertion in LoopBB.
+  Builder-&gt;SetInsertPoint(LoopBB);
+
+  // Within the loop, the variable is defined equal to the PHI node.  If it
+  // shadows an existing variable, we have to restore it, so save it now.
+  AllocaInst *OldVal = NamedValues[VarName];
+  NamedValues[VarName] = Alloca;
+
+  // Emit the body of the loop.  This, like any other expr, can change the
+  // current BB.  Note that we ignore the value computed by the body, but don&#x27;t
+  // allow an error.
+  if (!Body-&gt;codegen())
+    return nullptr;
+
+  // Emit the step value.
+  Value *StepVal = nullptr;
+  if (Step) {
+    StepVal = Step-&gt;codegen();
+    if (!StepVal)
+      return nullptr;
+  } else {
+    // If not specified, use 1.0.
+    StepVal = ConstantFP::get(*TheContext, APFloat(1.0));
+  }
+
+  // Compute the end condition.
+  Value *EndCond = End-&gt;codegen();
+  if (!EndCond)
+    return nullptr;
+
+  // Reload, increment, and restore the alloca.  This handles the case where
+  // the body of the loop mutates the variable.
+  Value *CurVar = Builder-&gt;CreateLoad(Type::getDoubleTy(*TheContext), Alloca,
+                                      VarName.c_str());
+  Value *NextVar = Builder-&gt;CreateFAdd(CurVar, StepVal, &quot;nextvar&quot;);
+  Builder-&gt;CreateStore(NextVar, Alloca);
+
+  // Convert condition to a bool by comparing non-equal to 0.0.
+  EndCond = Builder-&gt;CreateFCmpONE(
+      EndCond, ConstantFP::get(*TheContext, APFloat(0.0)), &quot;loopcond&quot;);
+
+  // Create the &quot;after loop&quot; block and insert it.
+  BasicBlock *AfterBB =
+      BasicBlock::Create(*TheContext, &quot;afterloop&quot;, TheFunction);
+
+  // Insert the conditional branch into the end of LoopEndBB.
+  Builder-&gt;CreateCondBr(EndCond, LoopBB, AfterBB);
+
+  // Any new code will be inserted in AfterBB.
+  Builder-&gt;SetInsertPoint(AfterBB);
+
+  // Restore the unshadowed variable.
+  if (OldVal)
+    NamedValues[VarName] = OldVal;
+  else
+    NamedValues.erase(VarName);
+
+  // for expr always returns 0.0.
+  return Constant::getNullValue(Type::getDoubleTy(*TheContext));
+}
+
+Value *VarExprAST::codegen() {
+  std::vector&lt;AllocaInst *&gt; OldBindings;
+
+  Function *TheFunction = Builder-&gt;GetInsertBlock()-&gt;getParent();
+
+  // Register all variables and emit their initializer.
+  for (unsigned i = 0, e = VarNames.size(); i != e; ++i) {
+    const std::string &amp;VarName = VarNames[i].first;
+    ExprAST *Init = VarNames[i].second.get();
+
+    // Emit the initializer before adding the variable to scope, this prevents
+    // the initializer from referencing the variable itself, and permits stuff
+    // like this:
+    //  var a = 1 in
+    //    var a = a in ...   # refers to outer &#x27;a&#x27;.
+    Value *InitVal;
+    if (Init) {
+      InitVal = Init-&gt;codegen();
+      if (!InitVal)
+        return nullptr;
+    } else { // If not specified, use 0.0.
+      InitVal = ConstantFP::get(*TheContext, APFloat(0.0));
+    }
+
+    AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+    Builder-&gt;CreateStore(InitVal, Alloca);
+
+    // Remember the old variable binding so that we can restore the binding when
+    // we unrecurse.
+    OldBindings.push_back(NamedValues[VarName]);
+
+    // Remember this binding.
+    NamedValues[VarName] = Alloca;
+  }
+
+  // Codegen the body, now that all vars are in scope.
+  Value *BodyVal = Body-&gt;codegen();
+  if (!BodyVal)
+    return nullptr;
+
+  // Pop all our variables from scope.
+  for (unsigned i = 0, e = VarNames.size(); i != e; ++i)
+    NamedValues[VarNames[i].first] = OldBindings[i];
+
+  // Return the body computation.
+  return BodyVal;
+}
+
+Function *PrototypeAST::codegen() {
+  // Make the function type:  double(double,double) etc.
+  std::vector&lt;Type *&gt; Doubles(Args.size(), Type::getDoubleTy(*TheContext));
+  FunctionType *FT =
+      FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false);
+
+  Function *F =
+      Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
+
+  // Set names for all arguments.
+  unsigned Idx = 0;
+  for (auto &amp;Arg : F-&gt;args())
+    Arg.setName(Args[Idx++]);
+
+  return F;
+}
+
+Function *FunctionAST::codegen() {
+  // Transfer ownership of the prototype to the FunctionProtos map, but keep a
+  // reference to it for use below.
+  auto &amp;P = *Proto;
+  FunctionProtos[Proto-&gt;getName()] = std::move(Proto);
+  Function *TheFunction = getFunction(P.getName());
+  if (!TheFunction)
+    return nullptr;
+
+  // If this is an operator, install it.
+  if (P.isBinaryOp())
+    BinopPrecedence[P.getOperatorName()] = P.getBinaryPrecedence();
+
+  // Create a new basic block to start insertion into.
+  BasicBlock *BB = BasicBlock::Create(*TheContext, &quot;entry&quot;, TheFunction);
+  Builder-&gt;SetInsertPoint(BB);
+
+  // Record the function arguments in the NamedValues map.
+  NamedValues.clear();
+  for (auto &amp;Arg : TheFunction-&gt;args()) {
+    // Create an alloca for this variable.
+    AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, Arg.getName());
+
+    // Store the initial value into the alloca.
+    Builder-&gt;CreateStore(&amp;Arg, Alloca);
+
+    // Add arguments to variable symbol table.
+    NamedValues[std::string(Arg.getName())] = Alloca;
+  }
+
+  if (Value *RetVal = Body-&gt;codegen()) {
+    // Finish off the function.
+    Builder-&gt;CreateRet(RetVal);
+
+    // Validate the generated code, checking for consistency.
+    verifyFunction(*TheFunction);
+
+    return TheFunction;
+  }
+
+  // Error reading body, remove function.
+  TheFunction-&gt;eraseFromParent();
+
+  if (P.isBinaryOp())
+    BinopPrecedence.erase(P.getOperatorName());
+  return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// Top-Level parsing and JIT Driver
+//===----------------------------------------------------------------------===//
+
+static void InitializeModuleAndPassManager() {
+  // Open a new module.
+  TheContext = std::make_unique&lt;LLVMContext&gt;();
+  TheModule = std::make_unique&lt;Module&gt;(&quot;my cool jit&quot;, *TheContext);
+
+  // Create a new builder for the module.
+  Builder = std::make_unique&lt;IRBuilder&lt;&gt;&gt;(*TheModule);
+}
+
+static void HandleDefinition() {
+  if (auto FnAST = ParseDefinition()) {
+    if (auto *FnIR = FnAST-&gt;codegen()) {
+      fprintf(stderr, &quot;Read function definition:&quot;);
+      FnIR-&gt;print(errs());
+      fprintf(stderr, &quot;\n&quot;);
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+static void HandleExtern() {
+  if (auto ProtoAST = ParseExtern()) {
+    if (auto *FnIR = ProtoAST-&gt;codegen()) {
+      fprintf(stderr, &quot;Read extern: &quot;);
+      FnIR-&gt;print(errs());
+      fprintf(stderr, &quot;\n&quot;);
+      FunctionProtos[ProtoAST-&gt;getName()] = std::move(ProtoAST);
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+static void HandleTopLevelExpression() {
+  // Evaluate a top-level expression into an anonymous function.
+  if (auto FnAST = ParseTopLevelExpr()) {
+    FnAST-&gt;codegen();
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+/// top ::= definition | external | expression | &#x27;;&#x27;
+static void MainLoop() {
+  while (true) {
+    switch (CurTok) {
+    case tok_eof:
+      return;
+    case &#x27;;&#x27;: // ignore top-level semicolons.
+      getNextToken();
+      break;
+    case tok_def:
+      HandleDefinition();
+      break;
+    case tok_extern:
+      HandleExtern();
+      break;
+    default:
+      HandleTopLevelExpression();
+      break;
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// &quot;Library&quot; functions that can be &quot;extern&#x27;d&quot; from user code.
+//===----------------------------------------------------------------------===//
+
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+/// putchard - putchar that takes a double and returns 0.
+extern &quot;C&quot; DLLEXPORT double putchard(double X) {
+  fputc((char)X, stderr);
+  return 0;
+}
+
+/// printd - printf that takes a double prints it as &quot;%f\n&quot;, returning 0.
+extern &quot;C&quot; DLLEXPORT double printd(double X) {
+  fprintf(stderr, &quot;%f\n&quot;, X);
+  return 0;
+}
+
+//===----------------------------------------------------------------------===//
+// Main driver code.
+//===----------------------------------------------------------------------===//
+
+int main() {
+  // Install standard binary operators.
+  // 1 is lowest precedence.
+  BinopPrecedence[&#x27;&lt;&#x27;] = 10;
+  BinopPrecedence[&#x27;+&#x27;] = 20;
+  BinopPrecedence[&#x27;-&#x27;] = 20;
+  BinopPrecedence[&#x27;*&#x27;] = 40; // highest.
+
+  // Prime the first token.
+  fprintf(stderr, &quot;ready&gt; &quot;);
+  getNextToken();
+
+  InitializeModuleAndPassManager();
+
+  // Run the main &quot;interpreter loop&quot; now.
+  MainLoop();
+
+  // Initialize the target registry etc.
+  InitializeAllTargetInfos();
+  InitializeAllTargets();
+  InitializeAllTargetMCs();
+  InitializeAllAsmParsers();
+  InitializeAllAsmPrinters();
+
+  auto TargetTriple = sys::getDefaultTargetTriple();
+  TheModule-&gt;setTargetTriple(Triple(TargetTriple));
+
+  std::string Error;
+  auto Target =
+      TargetRegistry::lookupTarget(TheModule-&gt;getTargetTriple(), Error);
+
+  // Print an error and exit if we couldn&#x27;t find the requested target.
+  // This generally occurs if we&#x27;ve forgotten to initialise the
+  // TargetRegistry or we have a bogus target triple.
+  if (!Target) {
+    errs() &lt;&lt; Error;
+    return 1;
+  }
+
+  auto CPU = &quot;generic&quot;;
+  auto Features = &quot;&quot;;
+
+  TargetOptions opt;
+  auto TheTargetMachine = Target-&gt;createTargetMachine(
+      Triple(TargetTriple), CPU, Features, opt, Reloc::PIC_);
+
+  TheModule-&gt;setDataLayout(
+      TheTargetMachine-&gt;getTargetTriple().computeDataLayout());
+
+  auto Filename = &quot;output.o&quot;;
+  std::error_code EC;
+  raw_fd_ostream dest(Filename, EC, sys::fs::OF_None);
+
+  if (EC) {
+    errs() &lt;&lt; &quot;Could not open file: &quot; &lt;&lt; EC.message();
+    return 1;
+  }
+
+  legacy::PassManager pass;
+  auto FileType = CodeGenFileType::ObjectFile;
+
+  if (TheTargetMachine-&gt;addPassesToEmitFile(pass, dest, nullptr, FileType)) {
+    errs() &lt;&lt; &quot;TheTargetMachine can&#x27;t emit a file of this type&quot;;
+    return 1;
+  }
+
+  pass.run(*TheModule);
+  dest.flush();
+
+  outs() &lt;&lt; &quot;Wrote &quot; &lt;&lt; Filename &lt;&lt; &quot;\n&quot;;
+
+  return 0;
+}
+</code></pre>
+<p>下一章：添加调试信息</p><h2 id="references">原文参考链接</h2><ul><li><a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/index.html">Implementing a language with LLVM</a></li><li><a href="https://clang.llvm.org/docs/CrossCompilation.html#target-triple">cross compilation docs</a></li><li><a href="https://llvm.org/docs/Frontend/PerformanceTips.html">frontend performance guide</a></li><li><a href="Kaleidoscope_Chapter9.html">Next: Adding Debug Information</a></li></ul><footer>原文与示例代码版权归 LLVM Project 及其贡献者；许可及最新内容见 <a href="https://llvm.org/docs/">LLVM 官方文档</a>。中文翻译中标注的“译注”用于补充版本和语义说明。</footer></body></html>

@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LLVM Kaleidoscope 第 10 章：总结与实用知识（中文翻译）</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;line-height:1.85;color:#242a35;background:#fff;max-width:920px;margin:0 auto;padding:42px 25px}h1{font-size:2rem;line-height:1.4;margin-bottom:8px}h2{font-size:1.5rem;border-bottom:1px solid #dae0e6;padding:24px 0 10px;margin-top:38px}p{margin:17px 0;font-size:16px}pre{background:#f4f6f9;border:1px solid #e1e6eb;border-radius:0 0 9px 9px;padding:17px;overflow:auto;line-height:1.5;font-size:13px;tab-size:2;margin-top:0}code{font-family:Consolas,"DejaVu Sans Mono",monospace}.code-title{background:#e9edf3;border-radius:9px 9px 0 0;padding:4px 14px;font-size:12px;color:#526174;margin-top:20px}nav{display:flex;flex-wrap:wrap;gap:10px;margin:24px 0;padding:18px;background:#f5f7fa;border-radius:10px}nav a{color:#1656a5;text-decoration:none;font-size:14px}blockquote{border-left:3px solid #888;padding-left:15px}.note{color:#546170;font-size:14px}a{color:#1656a5}@media print{body{padding:0}pre{white-space:pre-wrap;word-wrap:break-word}section{break-inside:auto}}h3{margin-top:30px}img{max-width:100%;height:auto}footer{border-top:1px solid #dae0e6;margin-top:40px;padding-top:15px;font-size:13px;color:#546170}li{margin:8px 0}</style></head><body><h1 id="kaleidoscope-conclusion-and-other-useful-llvm-tidbits">第十章：Kaleidoscope——总结与其他实用 LLVM 知识</h1><p class="note">根据 <a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl10.html">LLVM 官方第 10 章</a>翻译（原文获取日期：2026-11-10）。正文与各节说明译为中文；C++、LLVM IR、命令及输出完整保留原文。版式参考本项目第 3 章。原文可能使用比本项目 LLVM 18 更新的 API，应配合所安装版本的教程阅读；本页代码不是当前主程序已实现功能的声明。</p><nav aria-label="章节导航"><a href="index.html">目录</a><a href="Kaleidoscope_Chapter3.html">第 3 章：生成 LLVM IR</a><a href="Kaleidoscope_Chapter4.html">第 4 章：添加 JIT 和优化器支持</a><a href="Kaleidoscope_Chapter5.html">第 5 章：控制流</a><a href="Kaleidoscope_Chapter6.html">第 6 章：用户自定义运算符</a><a href="Kaleidoscope_Chapter7.html">第 7 章：可变变量</a><a href="Kaleidoscope_Chapter8.html">第 8 章：编译为目标文件</a><a href="Kaleidoscope_Chapter9.html">第 9 章：添加调试信息</a></nav><nav aria-label="本章目录"><a href="#tutorial-conclusion">10.1 教程总结</a><a href="#properties-of-the-llvm-ir">10.2 LLVM IR 的性质</a><a href="#tips-and-tricks">10.3 技巧与经验</a></nav><h2 id="tutorial-conclusion">10.1 教程总结</h2>
+<p>欢迎来到《使用 LLVM 实现一门语言》的最后一章。整个教程中，Kaleidoscope 从一个没什么用的玩具，逐渐成长为一个有些意思的玩具。</p>
+<p>回顾成果，可以看到代码量并不大：词法分析器、语法分析器、AST、代码生成器、带 JIT 的交互循环，以及独立可执行文件中的调试信息，原教程将这些功能控制在不足 1000 行非空、非注释代码中。</p>
+<p>这门小语言支持用户定义的一元与二元运算符、通过 JIT 立即求值，以及配合 SSA 构造的若干控制流结构。</p>
+<p>教程希望展示定义、实现和尝试一门语言可以很有趣，也不必神秘或令人畏惧。掌握这些基础后，可以继续修改代码，例如尝试以下扩展：</p>
+<p>全局变量：虽然在现代软件工程中应谨慎使用，但对于 Kaleidoscope 这样的快速实验很有帮助。现有结构很容易扩展：局部变量查找失败后，先查全局符号表，再决定是否报错。创建全局变量使用 LLVM GlobalVariable 类。</p>
+<p>带类型的变量：目前只支持 double，因此从不需要标注类型，形式很简洁。扩展类型系统有多种策略，最直接的是要求每次定义变量时指定类型，并把它与 Value* 一同记录在符号表中。</p>
+<p>数组、结构体、向量等：有了类型系统后，可以继续扩展。简单数组容易实现，在许多应用中也很实用。关键是理解 LLVM 的 getelementptr 指令；它的设计较特别，官方甚至为它准备了专门的 FAQ。</p>
+<p>标准运行库：当前语言允许调用任意外部函数，printd、putchard 就采用这种方式。更高级的语言构造往往适合降低为对语言运行库的调用。例如加入哈希表时，通常应把相关操作放进运行库，而非全部内联展开。</p>
+<p>内存管理：目前 Kaleidoscope 仅使用栈。可以通过 libc 的 malloc/free 或垃圾回收器支持堆分配。LLVM 支持精确垃圾回收，包括需要移动对象、扫描并更新栈的算法。</p>
+<p>异常处理：LLVM 支持生成可与其他语言代码互操作的零开销异常。也可以让每个函数隐式返回错误值并检查，或者显式使用 setjmp/longjmp；实现路径有多种。</p>
+<p>面向对象、泛型、数据库访问、复数、几何编程等：还可以加入许多其他功能。</p>
+<p>其他应用领域：LLVM 不只适合实现某门语言的编译器。编译技术还能应用到 OpenGL 图形加速、将 C++ 转为 ActionScript 等领域；也可以探索将正则表达式解释器即时编译为本机代码。这些是原教程提出的历史实例与探索方向。</p>
+<p>尽情实验一些不同寻常的想法。重复既有语言不如尝试新设计有趣。遇到问题或想交流时，可以在 LLVM 论坛讨论，那里有许多关注语言实现、愿意提供帮助的人。</p>
+<p>结束之前，再介绍一些生成 LLVM IR 时不太显眼、但有助于发挥 LLVM 能力的技巧。</p>
+<h2 id="properties-of-the-llvm-ir">10.2 LLVM IR 的性质</h2>
+<p>下面回答几个有关 LLVM IR 的常见问题。</p>
+<h3 id="target-independence">10.2.1 目标无关性</h3>
+<p>Kaleidoscope 是一种“可移植语言”：语言程序在不同目标上应有相同语义。Lisp、Java、Haskell、JavaScript、Python 等也具有类似目标；但语言可移植不代表其所有库都可移植。</p>
+<p>LLVM IR 通常可以保留这种目标无关性，使 Kaleidoscope 生成的 IR 在 LLVM 支持的不同目标上运行。原教程还提及先输出 C，再借助 C 编译器支持其他目标的路径。观察基础版本代码生成过程，它没有查询目标专有信息。译注：这里讨论的是基础 IR 语义；第八章生成目标文件时会显式设置目标与数据布局，原文提到的 C 输出路径也不等于当前 LLVM 默认附带 C 后端。</p>
+<p>紧凑、目标无关的代码表示很吸引人，但不能据此认定任意 C 或 C 家族程序也能通过 IR 实现完全移植。一般情况下，仍需要源码；即便源码本身，也常因平台假设而无法直接移植，例如老程序从 32 位迁移到 64 位。</p>
+<p>C 的完整语义带有大量目标相关假设。一个简单例子是，预处理器可能在处理输入时已经不可逆地丢弃某些目标的信息：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>#ifdef __i386__
+  int X = 1;
+#else
+  int X = 42;
+#endif
+</code></pre>
+<p>虽然可以为具体问题设计复杂方案，但一般情况下，这不会比保留并分发原始源码更好。</p>
+<p>当然，可以定义可移植的 C 子集：固定基本类型宽度，例如 int 为 32 位、long 为 64 位，放弃与现有二进制的 ABI 兼容，并限制少量其他特性。这在内核内嵌语言等特定领域可能有意义。</p>
+<h3 id="safety-guarantees">10.2.2 安全保证</h3>
+<p>上面的一些语言还具有安全性。例如，在 JVM 没有缺陷且遵循其安全语言约束的前提下，Java 程序不能任意破坏进程地址空间。安全性来自语言设计、运行时，以及通常还包括操作系统支持的共同作用。</p>
+<p>可以基于 LLVM 实现安全语言，但 LLVM IR 自身不保证安全。它允许不安全的指针转换，也可能出现释放后使用、缓冲区越界等问题。安全机制需要构建在 LLVM 之上；已有团队研究这些方向，可在 LLVM 论坛了解更多。</p>
+<h3 id="language-specific-optimizations">10.2.3 语言专用优化</h3>
+<p>LLVM 并非解决所有问题的单一系统。有人担心它会丢失过多高层信息，无法实现语言专用优化。可以从以下几个方面理解。</p>
+<p>首先，降低到 LLVM IR 确实会丢失信息。例如在 ILP32 平台，C 的 int 和 long 都可能变成 i32，除调试信息外，无法仅从值类型区分来源。原文以结构等价和名称等价的区别说明这一问题，还举了相同布局结构体的例子。译注：现代 LLVM 也有具名的 identified struct，不能把该历史表述理解成所有同布局结构体都必然合并；语言层面的名义类型语义仍需前端维护。</p>
+<p>其次，LLVM 持续演进，并非固定不变。除了异常、调试信息等新能力，IR 也不断增加有助于优化的信息，例如参数的符号或零扩展属性、指针别名信息。许多改进由用户需求推动并实现。</p>
+<p>第三，可以加入语言专用优化，而且有多种方法。例如编写理解某类语言语义的 pass。针对 C 家族的优化能够利用标准库知识，原文以 main 中 exit(0) 在满足相应条件时化为返回作为示例；关键在于优化器知道库函数的语义。</p>
+<p>除了库函数知识，也能向 LLVM IR 附加其他语言特定信息。遇到无法表达的需求，可以向 LLVM 开发者讨论；也可以把 LLVM 作为代码生成后端，在前端的语言专用 AST 上完成高层优化。</p>
+<h2 id="tips-and-tricks">10.3 技巧与经验</h2>
+<p>使用 LLVM 一段时间后，会发现一些初看不明显的技巧。本节集中介绍，避免每个人重新摸索。</p>
+<h3 id="implementing-portable-offsetof-sizeof">10.3.1 实现可移植的 offsetof / sizeof</h3>
+<p>如果希望编译器生成的代码保持目标无关，经常会遇到获取类型大小或结构体字段偏移的问题。例如调用内存分配函数时，需要传入类型大小。</p>
+<p>这些信息会因目标而异，指针宽度就是明显例子。不过可以巧妙地使用 getelementptr，以保留目标相关布局计算的方式表达这些需求；具体方法参见原文关联的 LLVM 文档。</p>
+<h3 id="garbage-collected-stack-frames">10.3.2 可由垃圾回收管理的栈帧</h3>
+<p>一些语言希望显式管理栈帧，以便进行垃圾回收或实现闭包。通常还有更合适的方法，但 LLVM 也支持这一思路：前端将程序转换为续延传递风格（Continuation Passing Style，CPS），并使用 LLVM 支持的尾调用。</p><h2 id="references">原文参考链接</h2><ul><li><a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/index.html">Implementing a language with LLVM</a></li><li><a href="https://llvm.org/docs/LangRef.html#getelementptr-instruction">getelementptr</a></li><li><a href="https://llvm.org/docs/GetElementPtr.html">has its own FAQ</a></li><li><a href="https://llvm.org/docs/GarbageCollection.html">Accurate Garbage Collection</a></li><li><a href="https://llvm.org/docs/ExceptionHandling.html">zero cost exceptions</a></li><li><a href="https://discourse.llvm.org">LLVM forums</a></li><li><a href="http://nondot.org/sabre/LLVMNotes/SizeOf-OffsetOf-VariableSizedStructs.txt">clever way to use the getelementptr instruction</a></li><li><a href="http://nondot.org/sabre/LLVMNotes/ExplicitlyManagedStackFrames.txt">LLVM does support them,</a></li><li><a href="http://en.wikipedia.org/wiki/Continuation-passing_style">Continuation Passing Style</a></li></ul><footer>原文与示例代码版权归 LLVM Project 及其贡献者；许可及最新内容见 <a href="https://llvm.org/docs/">LLVM 官方文档</a>。中文翻译中标注的“译注”用于补充版本和语义说明。</footer></body></html>

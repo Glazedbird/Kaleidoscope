@@ -1,0 +1,1466 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LLVM Kaleidoscope 第 5 章：控制流（中文翻译）</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;line-height:1.85;color:#242a35;background:#fff;max-width:920px;margin:0 auto;padding:42px 25px}h1{font-size:2rem;line-height:1.4;margin-bottom:8px}h2{font-size:1.5rem;border-bottom:1px solid #dae0e6;padding:24px 0 10px;margin-top:38px}p{margin:17px 0;font-size:16px}pre{background:#f4f6f9;border:1px solid #e1e6eb;border-radius:0 0 9px 9px;padding:17px;overflow:auto;line-height:1.5;font-size:13px;tab-size:2;margin-top:0}code{font-family:Consolas,"DejaVu Sans Mono",monospace}.code-title{background:#e9edf3;border-radius:9px 9px 0 0;padding:4px 14px;font-size:12px;color:#526174;margin-top:20px}nav{display:flex;flex-wrap:wrap;gap:10px;margin:24px 0;padding:18px;background:#f5f7fa;border-radius:10px}nav a{color:#1656a5;text-decoration:none;font-size:14px}blockquote{border-left:3px solid #888;padding-left:15px}.note{color:#546170;font-size:14px}a{color:#1656a5}@media print{body{padding:0}pre{white-space:pre-wrap;word-wrap:break-word}section{break-inside:auto}}h3{margin-top:30px}img{max-width:100%;height:auto}footer{border-top:1px solid #dae0e6;margin-top:40px;padding-top:15px;font-size:13px;color:#546170}li{margin:8px 0}</style></head><body><h1 id="kaleidoscope-extending-the-language-control-flow">第五章：Kaleidoscope——扩展语言：控制流</h1><p class="note">根据 <a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl05.html">LLVM 官方第 5 章</a>翻译（原文获取日期：2026-11-10）。正文与各节说明译为中文；C++、LLVM IR、命令及输出完整保留原文。版式参考本项目第 3 章。原文可能使用比本项目 LLVM 18 更新的 API，应配合所安装版本的教程阅读；本页代码不是当前主程序已实现功能的声明。</p><nav aria-label="章节导航"><a href="index.html">目录</a><a href="Kaleidoscope_Chapter3.html">第 3 章：生成 LLVM IR</a><a href="Kaleidoscope_Chapter4.html">第 4 章：添加 JIT 和优化器支持</a><a href="Kaleidoscope_Chapter6.html">第 6 章：用户自定义运算符</a><a href="Kaleidoscope_Chapter7.html">第 7 章：可变变量</a><a href="Kaleidoscope_Chapter8.html">第 8 章：编译为目标文件</a><a href="Kaleidoscope_Chapter9.html">第 9 章：添加调试信息</a><a href="Kaleidoscope_Chapter10.html">第 10 章：总结与实用知识</a></nav><nav aria-label="本章目录"><a href="#chapter-5-introduction">5.1 第五章简介</a><a href="#if-then-else">5.2 If/Then/Else</a><a href="#for-loop-expression">5.3 for 循环表达式</a><a href="#full-code-listing">5.4 完整代码清单</a></nav><h2 id="chapter-5-introduction">5.1 第五章简介</h2>
+<p>欢迎来到《使用 LLVM 实现一门语言》第五章。前四章实现了简单的 Kaleidoscope 语言，支持生成 LLVM IR、优化和 JIT 编译。不过，它目前除了调用与返回之外没有控制流，无法编写条件分支，表达能力受到很大限制。本章将加入 if/then/else 表达式和简单的 for 循环。</p>
+<h2 id="if-then-else">5.2 If/Then/Else</h2>
+<p>加入 if/then/else 的过程很直接：让词法分析器、语法分析器、AST 和 LLVM 代码生成器支持这个新概念。这个例子展示了如何随着新想法的出现，逐步扩展一门语言。</p>
+<p>在讨论如何实现之前，先明确希望支持的写法：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>def fib(x)
+  if x &lt; 3 then
+    1
+  else
+    fib(x-1)+fib(x-2);
+</code></pre>
+<p>Kaleidoscope 的所有构造都是表达式，没有语句，因此 if/then/else 也必须返回一个值。沿用偏函数式的形式，我们先计算条件，再根据结果返回 then 或 else 分支的值，类似 C 的 ?: 表达式。</p>
+<p>条件值用于决定真假：0.0 视为假，其他值视为真。条件为真时只计算并返回第一个子表达式，否则只计算并返回第二个。由于 Kaleidoscope 允许副作用，明确这种选择性求值行为十分重要。</p>
+<p>明确目标后，把实现分解为几个部分。</p>
+<h3 id="lexer-extensions-for-if-then-else">5.2.1 为 If/Then/Else 扩展词法分析器</h3>
+<p>首先为相关 token 添加枚举值：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>// control
+tok_if = -6,
+tok_then = -7,
+tok_else = -8,
+</code></pre>
+<p>然后在词法分析器中识别这些新关键字：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>...
+if (IdentifierStr == &quot;def&quot;)
+  return tok_def;
+if (IdentifierStr == &quot;extern&quot;)
+  return tok_extern;
+if (IdentifierStr == &quot;if&quot;)
+  return tok_if;
+if (IdentifierStr == &quot;then&quot;)
+  return tok_then;
+if (IdentifierStr == &quot;else&quot;)
+  return tok_else;
+return tok_identifier;
+</code></pre>
+<h3 id="ast-extensions-for-if-then-else">5.2.2 为 If/Then/Else 扩展 AST</h3>
+<p>添加一个 AST 节点，表示这种新表达式：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>/// IfExprAST - Expression class for if/then/else.
+class IfExprAST : public ExprAST {
+  std::unique_ptr&lt;ExprAST&gt; Cond, Then, Else;
+
+public:
+  IfExprAST(std::unique_ptr&lt;ExprAST&gt; Cond, std::unique_ptr&lt;ExprAST&gt; Then,
+            std::unique_ptr&lt;ExprAST&gt; Else)
+    : Cond(std::move(Cond)), Then(std::move(Then)), Else(std::move(Else)) {}
+
+  Value *codegen() override;
+};
+</code></pre>
+<p>该节点只需要保存各子表达式的指针。</p>
+<h3 id="parser-extensions-for-if-then-else">5.2.3 为 If/Then/Else 扩展语法分析器</h3>
+<p>词法分析器已经能提供相关 token，也有了可构建的 AST 节点，解析逻辑就很直接了。先定义新的解析函数：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>/// ifexpr ::= &#x27;if&#x27; expression &#x27;then&#x27; expression &#x27;else&#x27; expression
+static std::unique_ptr&lt;ExprAST&gt; ParseIfExpr() {
+  getNextToken();  // eat the if.
+
+  // condition.
+  auto Cond = ParseExpression();
+  if (!Cond)
+    return nullptr;
+
+  if (CurTok != tok_then)
+    return LogError(&quot;expected then&quot;);
+  getNextToken();  // eat the then
+
+  auto Then = ParseExpression();
+  if (!Then)
+    return nullptr;
+
+  if (CurTok != tok_else)
+    return LogError(&quot;expected else&quot;);
+
+  getNextToken();
+
+  auto Else = ParseExpression();
+  if (!Else)
+    return nullptr;
+
+  return std::make_unique&lt;IfExprAST&gt;(std::move(Cond), std::move(Then),
+                                      std::move(Else));
+}
+</code></pre>
+<p>再把它接入基本表达式的分派：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>static std::unique_ptr&lt;ExprAST&gt; ParsePrimary() {
+  switch (CurTok) {
+  default:
+    return LogError(&quot;unknown token when expecting an expression&quot;);
+  case tok_identifier:
+    return ParseIdentifierExpr();
+  case tok_number:
+    return ParseNumberExpr();
+  case &#x27;(&#x27;:
+    return ParseParenExpr();
+  case tok_if:
+    return ParseIfExpr();
+  }
+}
+</code></pre>
+<h3 id="llvm-ir-for-if-then-else">5.2.4 If/Then/Else 对应的 LLVM IR</h3>
+<p>解析和 AST 构建完成后，最后一步是生成 LLVM IR。这是本例最有意思的部分，因为将引入新概念；前面的改动都沿用了此前章节的方法。</p>
+<p>先通过一个简单例子了解希望生成的代码：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>extern foo();
+extern bar();
+def baz(x) if x then foo() else bar();
+</code></pre>
+<p>关闭优化时，稍后 Kaleidoscope 将生成如下 IR：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>declare double @foo()
+
+declare double @bar()
+
+define double @baz(double %x) {
+entry:
+  %ifcond = fcmp one double %x, 0.000000e+00
+  br i1 %ifcond, label %then, label %else
+
+then:       ; preds = %entry
+  %calltmp = call double @foo()
+  br label %ifcont
+
+else:       ; preds = %entry
+  %calltmp1 = call double @bar()
+  br label %ifcont
+
+ifcont:     ; preds = %else, %then
+  %iftmp = phi double [ %calltmp, %then ], [ %calltmp1, %else ]
+  ret double %iftmp
+}
+</code></pre>
+<p>可以利用 opt 的图形显示功能查看控制流图。把 IR 存入 t.ll，运行“llvm-as &lt; t.ll | opt -passes=view-cfg”，便可弹出显示此图的窗口：</p>
+<figure><img src="assets/LangImpl05-cfg.png" alt="if/then/else 控制流图"></figure>
+<p>控制流图示例</p>
+<p>也可以调用 F-&gt;viewCFG() 或 F-&gt;viewCFGOnly()，其中 F 是 Function*。既可以把调用写入源码并重新编译，也可以在调试器中调用。LLVM 提供了多种图结构可视化功能。</p>
+<p>生成的代码并不复杂：entry 块计算条件表达式，此处为 x，然后用 fcmp one 与 0.0 比较。one 表示“有序且不相等”（Ordered and Not Equal）。根据比较结果，跳到包含真假分支表达式的 then 或 else 块。</p>
+<p>then 和 else 执行结束后都跳到 ifcont 块，继续执行条件表达式之后的代码。本例只剩返回调用者。问题是：如何知道应当返回哪个表达式的值？</p>
+<p>答案是 SSA 中重要的 Phi 操作。如果不熟悉 SSA，可先阅读相关入门材料。简单说，Phi 根据控制流从哪个前驱块到达，选择相应输入值：从 then 块进入时取 calltmp，从 else 块进入时取 calltmp1。</p>
+<p>你可能担心：为了使用 LLVM，前端是否必须实现 SSA 构造算法？并非如此，除非理由非常充分，否则不建议在前端自行实现。常见命令式语言中，可能需要 Phi 的值大致有两类：</p>
+<p>涉及用户变量的代码，例如 x = 1; x = x + 1;</p>
+<p>AST 结构中隐含的值，例如本例中条件表达式的合并结果。</p>
+<p>第七章“可变变量”将详细处理第一类情况，无需前端自行构造 SSA。第二类既可采用第七章的方法，也可以在方便时直接插入 Phi。本例中的 Phi 很容易生成，因此选择直接构建。</p>
+<p>背景介绍到此，开始生成代码！</p>
+<h3 id="code-generation-for-if-then-else">5.2.5 If/Then/Else 的代码生成</h3>
+<p>实现 IfExprAST 的 codegen 方法：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>Value *IfExprAST::codegen() {
+  Value *CondV = Cond-&gt;codegen();
+  if (!CondV)
+    return nullptr;
+
+  // Convert condition to a bool by comparing non-equal to 0.0.
+  CondV = Builder-&gt;CreateFCmpONE(
+      CondV, ConstantFP::get(*TheContext, APFloat(0.0)), &quot;ifcond&quot;);
+</code></pre>
+<p>这与之前的代码类似：先生成条件表达式，再与零比较，得到一个 1 位布尔值。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>Function *TheFunction = Builder-&gt;GetInsertBlock()-&gt;getParent();
+
+// Create blocks for the then and else cases.  Insert the &#x27;then&#x27; block at the
+// end of the function.
+BasicBlock *ThenBB =
+    BasicBlock::Create(*TheContext, &quot;then&quot;, TheFunction);
+BasicBlock *ElseBB = BasicBlock::Create(*TheContext, &quot;else&quot;);
+BasicBlock *MergeBB = BasicBlock::Create(*TheContext, &quot;ifcont&quot;);
+
+Builder-&gt;CreateCondBr(CondV, ThenBB, ElseBB);
+</code></pre>
+<p>接着创建与 if/then/else 对应的基本块，与前面的 IR 示例一一对应。第一行通过 Builder 当前的 BasicBlock 取得其父对象，也就是正在构建的 Function。</p>
+<p>随后创建三个块。创建 then 块时传入 TheFunction，因此构造函数自动把它追加到函数末尾；另外两个块暂时只创建，不加入函数。</p>
+<p>创建块后，生成选择 then 或 else 的条件分支。创建基本块不会改变 IRBuilder 的插入位置，所以分支仍插入条件表达式所在的块。此时 else 还没有加入函数，但分支可以先引用它；这是 LLVM 支持前向引用的正常方式。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>// Emit then value.
+Builder-&gt;SetInsertPoint(ThenBB);
+
+Value *ThenV = Then-&gt;codegen();
+if (!ThenV)
+  return nullptr;
+
+Builder-&gt;CreateBr(MergeBB);
+// Codegen of &#x27;Then&#x27; can change the current block, update ThenBB for the PHI.
+ThenBB = Builder-&gt;GetInsertBlock();
+</code></pre>
+<p>条件分支插入后，把 Builder 的插入点移到 then 块末尾。由于它还是空块，这里同时也是块的起点。</p>
+<p>递归生成 then 表达式后，用无条件分支跳到合并块。LLVM IR 要求每个基本块都以 return、branch 等控制流终结指令结束；即便是顺序落入下一块，也必须显式表示。违反这一规则，验证器就会报错。</p>
+<p>最后一行重新读取当前基本块非常关键。合并块中的 Phi 需要为控制流图里的每个前驱块设置“块—值”对。虽然前面刚把插入点设为 ThenBB，但 then 表达式自身可能包含嵌套 if/then/else，递归 codegen() 会改变当前块。因此创建 Phi 前必须取得最新的实际前驱块。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>// Emit else block.
+TheFunction-&gt;insert(TheFunction-&gt;end(), ElseBB);
+Builder-&gt;SetInsertPoint(ElseBB);
+
+Value *ElseV = Else-&gt;codegen();
+if (!ElseV)
+  return nullptr;
+
+Builder-&gt;CreateBr(MergeBB);
+// codegen of &#x27;Else&#x27; can change the current block, update ElseBB for the PHI.
+ElseBB = Builder-&gt;GetInsertBlock();
+</code></pre>
+<p>else 的生成与 then 基本相同，主要区别是第一行将此前尚未挂接的 else 块加入函数。两个分支生成完毕后，处理合并部分：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>  // Emit merge block.
+  TheFunction-&gt;insert(TheFunction-&gt;end(), MergeBB);
+  Builder-&gt;SetInsertPoint(MergeBB);
+  PHINode *PN =
+    Builder-&gt;CreatePHI(Type::getDoubleTy(*TheContext), 2, &quot;iftmp&quot;);
+
+  PN-&gt;addIncoming(ThenV, ThenBB);
+  PN-&gt;addIncoming(ElseV, ElseBB);
+  return PN;
+}
+</code></pre>
+<p>前两行分别把合并块加入 Function，并将插入点移到该块。随后创建 PHI 节点，设置来自各前驱块的输入值。</p>
+<p>最后返回 Phi 节点，作为 if/then/else 表达式的计算结果。在前面的例子里，函数代码生成会使用这个值创建返回指令。</p>
+<p>现在 Kaleidoscope 可以执行条件代码了，已经能够表示多种数值函数。接下来再加入一个非函数式语言中常见的表达式。</p>
+<h2 id="for-loop-expression">5.3 for 循环表达式</h2>
+<p>掌握基本控制流的实现后，可以进一步加入 for 表达式：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>extern putchard(char);
+def printstar(n)
+  for i = 1, i &lt; n, 1.0 in
+    putchard(42);  # ascii 42 = &#x27;*&#x27;
+
+# print 100 &#x27;*&#x27; characters
+printstar(100);
+</code></pre>
+<p>该表达式定义一个新变量，此处为 i，从初值开始迭代，并按可选步长递增。示例的继续条件为 i &lt; n，步长为 1.0；省略步长时默认使用 1.0。循环执行其主体，并根据条件决定是否继续。当前没有更合适的返回值，因此规定循环始终返回 0.0。加入可变变量后，它会更有用。译注：下方实现先执行循环体，再检查继续条件，循环体至少执行一次。</p>
+<p>同样，先逐项讨论需要对 Kaleidoscope 做出的改动。</p>
+<h3 id="lexer-extensions-for-the-for-loop">5.3.1 为 for 循环扩展词法分析器</h3>
+<p>词法扩展与 if/then/else 类似：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>... in enum Token ...
+// control
+tok_if = -6, tok_then = -7, tok_else = -8,
+tok_for = -9, tok_in = -10
+
+... in gettok ...
+if (IdentifierStr == &quot;def&quot;)
+  return tok_def;
+if (IdentifierStr == &quot;extern&quot;)
+  return tok_extern;
+if (IdentifierStr == &quot;if&quot;)
+  return tok_if;
+if (IdentifierStr == &quot;then&quot;)
+  return tok_then;
+if (IdentifierStr == &quot;else&quot;)
+  return tok_else;
+if (IdentifierStr == &quot;for&quot;)
+  return tok_for;
+if (IdentifierStr == &quot;in&quot;)
+  return tok_in;
+return tok_identifier;
+</code></pre>
+<h3 id="ast-extensions-for-the-for-loop">5.3.2 为 for 循环扩展 AST</h3>
+<p>AST 节点也很简单，只需保存变量名及构成循环的各个表达式。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>/// ForExprAST - Expression class for for/in.
+class ForExprAST : public ExprAST {
+  std::string VarName;
+  std::unique_ptr&lt;ExprAST&gt; Start, End, Step, Body;
+
+public:
+  ForExprAST(const std::string &amp;VarName, std::unique_ptr&lt;ExprAST&gt; Start,
+             std::unique_ptr&lt;ExprAST&gt; End, std::unique_ptr&lt;ExprAST&gt; Step,
+             std::unique_ptr&lt;ExprAST&gt; Body)
+    : VarName(VarName), Start(std::move(Start)), End(std::move(End)),
+      Step(std::move(Step)), Body(std::move(Body)) {}
+
+  Value *codegen() override;
+};
+</code></pre>
+<h3 id="parser-extensions-for-the-for-loop">5.3.3 为 for 循环扩展语法分析器</h3>
+<p>解析代码基本沿用惯例。值得关注的是可选步长：检查是否出现第二个逗号，若没有，就把 AST 中的步长指针设为空。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>/// forexpr ::= &#x27;for&#x27; identifier &#x27;=&#x27; expr &#x27;,&#x27; expr (&#x27;,&#x27; expr)? &#x27;in&#x27; expression
+static std::unique_ptr&lt;ExprAST&gt; ParseForExpr() {
+  getNextToken();  // eat the for.
+
+  if (CurTok != tok_identifier)
+    return LogError(&quot;expected identifier after for&quot;);
+
+  std::string IdName = IdentifierStr;
+  getNextToken();  // eat identifier.
+
+  if (CurTok != &#x27;=&#x27;)
+    return LogError(&quot;expected &#x27;=&#x27; after for&quot;);
+  getNextToken();  // eat &#x27;=&#x27;.
+
+
+  auto Start = ParseExpression();
+  if (!Start)
+    return nullptr;
+  if (CurTok != &#x27;,&#x27;)
+    return LogError(&quot;expected &#x27;,&#x27; after for start value&quot;);
+  getNextToken();
+
+  auto End = ParseExpression();
+  if (!End)
+    return nullptr;
+
+  // The step value is optional.
+  std::unique_ptr&lt;ExprAST&gt; Step;
+  if (CurTok == &#x27;,&#x27;) {
+    getNextToken();
+    Step = ParseExpression();
+    if (!Step)
+      return nullptr;
+  }
+
+  if (CurTok != tok_in)
+    return LogError(&quot;expected &#x27;in&#x27; after for&quot;);
+  getNextToken();  // eat &#x27;in&#x27;.
+
+  auto Body = ParseExpression();
+  if (!Body)
+    return nullptr;
+
+  return std::make_unique&lt;ForExprAST&gt;(IdName, std::move(Start),
+                                       std::move(End), std::move(Step),
+                                       std::move(Body));
+}
+</code></pre>
+<p>再次把它接入基本表达式分派：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>static std::unique_ptr&lt;ExprAST&gt; ParsePrimary() {
+  switch (CurTok) {
+  default:
+    return LogError(&quot;unknown token when expecting an expression&quot;);
+  case tok_identifier:
+    return ParseIdentifierExpr();
+  case tok_number:
+    return ParseNumberExpr();
+  case &#x27;(&#x27;:
+    return ParseParenExpr();
+  case tok_if:
+    return ParseIfExpr();
+  case tok_for:
+    return ParseForExpr();
+  }
+}
+</code></pre>
+<h3 id="llvm-ir-for-the-for-loop">5.3.4 for 循环对应的 LLVM IR</h3>
+<p>接下来看看希望生成的 LLVM IR。前面的简单循环会得到如下结果，为清晰起见关闭了优化：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>declare double @putchard(double)
+
+define double @printstar(double %n) {
+entry:
+  ; initial value = 1.0 (inlined into phi)
+  br label %loop
+
+loop:       ; preds = %loop, %entry
+  %i = phi double [ 1.000000e+00, %entry ], [ %nextvar, %loop ]
+  ; body
+  %calltmp = call double @putchard(double 4.200000e+01)
+  ; increment
+  %nextvar = fadd double %i, 1.000000e+00
+
+  ; termination test
+  %cmptmp = fcmp ult double %i, %n
+  %booltmp = uitofp i1 %cmptmp to double
+  %loopcond = fcmp one double %booltmp, 0.000000e+00
+  br i1 %loopcond, label %loop, label %afterloop
+
+afterloop:      ; preds = %loop
+  ; loop always returns 0.0
+  ret double 0.000000e+00
+}
+</code></pre>
+<p>这里仍然由之前见过的元素组成：Phi 节点、若干表达式和基本块。下面将它们连接起来。</p>
+<h3 id="code-generation-for-the-for-loop">5.3.5 for 循环的代码生成</h3>
+<p>首先生成循环变量的初值表达式：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>Value *ForExprAST::codegen() {
+  // Emit the start code first, without &#x27;variable&#x27; in scope.
+  Value *StartVal = Start-&gt;codegen();
+  if (!StartVal)
+    return nullptr;
+</code></pre>
+<p>然后为循环体起点创建基本块。示例的循环体只有一个块，但实际循环体可能包含 if/then/else 或 for/in，从而产生多个块。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>// Make the new basic block for the loop header, inserting after current
+// block.
+Function *TheFunction = Builder-&gt;GetInsertBlock()-&gt;getParent();
+BasicBlock *PreheaderBB = Builder-&gt;GetInsertBlock();
+BasicBlock *LoopBB =
+    BasicBlock::Create(*TheContext, &quot;loop&quot;, TheFunction);
+
+// Insert an explicit fall through from the current block to the LoopBB.
+Builder-&gt;CreateBr(LoopBB);
+</code></pre>
+<p>这与条件表达式的生成类似。先保存进入循环的前置块，以便稍后构建 Phi；再创建循环起始块，并用无条件分支把两个块连接起来。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>// Start insertion in LoopBB.
+Builder-&gt;SetInsertPoint(LoopBB);
+
+// Start the PHI node with an entry for Start.
+PHINode *Variable = Builder-&gt;CreatePHI(Type::getDoubleTy(*TheContext),
+                                       2, VarName);
+Variable-&gt;addIncoming(StartVal, PreheaderBB);
+</code></pre>
+<p>循环的前置块（preheader）准备好后，切换插入点并为归纳变量创建 PHI。初始输入值已经确定，可以立即加入；循环回边对应的第二个输入尚未产生，稍后再补。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>// Within the loop, the variable is defined equal to the PHI node.  If it
+// shadows an existing variable, we have to restore it, so save it now.
+Value *OldVal = NamedValues[VarName];
+NamedValues[VarName] = Variable;
+
+// Emit the body of the loop.  This, like any other expr, can change the
+// current BB.  Note that we ignore the value computed by the body, but don&#x27;t
+// allow an error.
+if (!Body-&gt;codegen())
+  return nullptr;
+</code></pre>
+<p>for 会向符号表引入新变量，因此符号表现在既可能保存函数参数，也可能保存循环变量。生成循环体前，将该名称绑定到循环变量。如果外层存在同名变量，可以选择报错，但这里允许变量遮蔽。用 OldVal 保存旧绑定；不存在旧变量时，它为空。</p>
+<p>绑定好循环变量后递归生成循环体。循环体中的变量引用自然会从符号表找到这一绑定。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>// Emit the step value.
+Value *StepVal = nullptr;
+if (Step) {
+  StepVal = Step-&gt;codegen();
+  if (!StepVal)
+    return nullptr;
+} else {
+  // If not specified, use 1.0.
+  StepVal = ConstantFP::get(*TheContext, APFloat(1.0));
+}
+
+Value *NextVar = Builder-&gt;CreateFAdd(Variable, StepVal, &quot;nextvar&quot;);
+</code></pre>
+<p>循环体生成完毕后，加上指定步长；若省略步长，则加 1.0。NextVar 表示下一轮迭代的循环变量值。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>// Compute the end condition.
+Value *EndCond = End-&gt;codegen();
+if (!EndCond)
+  return nullptr;
+
+// Convert condition to a bool by comparing non-equal to 0.0.
+EndCond = Builder-&gt;CreateFCmpONE(
+    EndCond, ConstantFP::get(*TheContext, APFloat(0.0)), &quot;loopcond&quot;);
+</code></pre>
+<p>随后计算循环的继续条件，判断是否退出。这与 if/then/else 的条件计算方式相同。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>// Create the &quot;after loop&quot; block and insert it.
+BasicBlock *LoopEndBB = Builder-&gt;GetInsertBlock();
+BasicBlock *AfterBB =
+    BasicBlock::Create(*TheContext, &quot;afterloop&quot;, TheFunction);
+
+// Insert the conditional branch into the end of LoopEndBB.
+Builder-&gt;CreateCondBr(EndCond, LoopBB, AfterBB);
+
+// Any new code will be inserted in AfterBB.
+Builder-&gt;SetInsertPoint(AfterBB);
+</code></pre>
+<p>最后补全控制流：保存循环体结束块供 Phi 使用，创建退出块 afterloop，根据条件选择再次进入循环还是退出。后续代码应插入 afterloop，因此更新插入点。</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>  // Add a new entry to the PHI node for the backedge.
+  Variable-&gt;addIncoming(NextVar, LoopEndBB);
+
+  // Restore the unshadowed variable.
+  if (OldVal)
+    NamedValues[VarName] = OldVal;
+  else
+    NamedValues.erase(VarName);
+
+  // for expr always returns 0.0.
+  return Constant::getNullValue(Type::getDoubleTy(*TheContext));
+}
+</code></pre>
+<p>收尾时，将 NextVar 和回边前驱块加入循环 PHI；从符号表移除循环变量，或恢复被遮蔽的旧绑定，使其作用域在循环结束时终止。ForExprAST::codegen() 最后返回 0.0。</p>
+<p>本章加入了两种控制流结构，并借此介绍了前端实现者需要掌握的 LLVM IR 概念。下一章将继续扩展语言，加入用户自定义运算符。</p>
+<h2 id="full-code-listing">5.4 完整代码清单</h2>
+<p>下面是加入 if/then/else 和 for 表达式后的完整示例。编译方式如下：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code># Compile
+clang++ -g toy.cpp `llvm-config --cxxflags --ldflags --system-libs --libs core orcjit native` -O3 -o toy
+# Run
+./toy
+</code></pre>
+<p>完整代码如下：</p>
+<div class="code-title">源码 / 命令 / 输出 · 原文保留</div><pre><code>#include &quot;../include/KaleidoscopeJIT.h&quot;
+#include &quot;llvm/ADT/APFloat.h&quot;
+#include &quot;llvm/ADT/STLExtras.h&quot;
+#include &quot;llvm/IR/BasicBlock.h&quot;
+#include &quot;llvm/IR/Constants.h&quot;
+#include &quot;llvm/IR/DerivedTypes.h&quot;
+#include &quot;llvm/IR/Function.h&quot;
+#include &quot;llvm/IR/IRBuilder.h&quot;
+#include &quot;llvm/IR/Instructions.h&quot;
+#include &quot;llvm/IR/LLVMContext.h&quot;
+#include &quot;llvm/IR/Module.h&quot;
+#include &quot;llvm/IR/PassManager.h&quot;
+#include &quot;llvm/IR/Type.h&quot;
+#include &quot;llvm/IR/Verifier.h&quot;
+#include &quot;llvm/Passes/PassBuilder.h&quot;
+#include &quot;llvm/Passes/StandardInstrumentations.h&quot;
+#include &quot;llvm/Support/TargetSelect.h&quot;
+#include &quot;llvm/Target/TargetMachine.h&quot;
+#include &quot;llvm/Transforms/InstCombine/InstCombine.h&quot;
+#include &quot;llvm/Transforms/Scalar.h&quot;
+#include &quot;llvm/Transforms/Scalar/GVN.h&quot;
+#include &quot;llvm/Transforms/Scalar/Reassociate.h&quot;
+#include &quot;llvm/Transforms/Scalar/SimplifyCFG.h&quot;
+#include &lt;algorithm&gt;
+#include &lt;cassert&gt;
+#include &lt;cctype&gt;
+#include &lt;cstdint&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+using namespace llvm;
+using namespace llvm::orc;
+
+//===----------------------------------------------------------------------===//
+// Lexer
+//===----------------------------------------------------------------------===//
+
+// The lexer returns tokens [0-255] if it is an unknown character, otherwise one
+// of these for known things.
+enum Token {
+  tok_eof = -1,
+
+  // commands
+  tok_def = -2,
+  tok_extern = -3,
+
+  // primary
+  tok_identifier = -4,
+  tok_number = -5,
+
+  // control
+  tok_if = -6,
+  tok_then = -7,
+  tok_else = -8,
+  tok_for = -9,
+  tok_in = -10
+};
+
+static std::string IdentifierStr; // Filled in if tok_identifier
+static double NumVal;             // Filled in if tok_number
+
+/// gettok - Return the next token from standard input.
+static int gettok() {
+  static int LastChar = &#x27; &#x27;;
+
+  // Skip any whitespace.
+  while (isspace(LastChar))
+    LastChar = getchar();
+
+  if (isalpha(LastChar)) { // identifier: [a-zA-Z][a-zA-Z0-9]*
+    IdentifierStr = LastChar;
+    while (isalnum((LastChar = getchar())))
+      IdentifierStr += LastChar;
+
+    if (IdentifierStr == &quot;def&quot;)
+      return tok_def;
+    if (IdentifierStr == &quot;extern&quot;)
+      return tok_extern;
+    if (IdentifierStr == &quot;if&quot;)
+      return tok_if;
+    if (IdentifierStr == &quot;then&quot;)
+      return tok_then;
+    if (IdentifierStr == &quot;else&quot;)
+      return tok_else;
+    if (IdentifierStr == &quot;for&quot;)
+      return tok_for;
+    if (IdentifierStr == &quot;in&quot;)
+      return tok_in;
+    return tok_identifier;
+  }
+
+  if (isdigit(LastChar) || LastChar == &#x27;.&#x27;) { // Number: [0-9.]+
+    std::string NumStr;
+    do {
+      NumStr += LastChar;
+      LastChar = getchar();
+    } while (isdigit(LastChar) || LastChar == &#x27;.&#x27;);
+
+    NumVal = strtod(NumStr.c_str(), nullptr);
+    return tok_number;
+  }
+
+  if (LastChar == &#x27;#&#x27;) {
+    // Comment until end of line.
+    do
+      LastChar = getchar();
+    while (LastChar != EOF &amp;&amp; LastChar != &#x27;\n&#x27; &amp;&amp; LastChar != &#x27;\r&#x27;);
+
+    if (LastChar != EOF)
+      return gettok();
+  }
+
+  // Check for end of file.  Don&#x27;t eat the EOF.
+  if (LastChar == EOF)
+    return tok_eof;
+
+  // Otherwise, just return the character as its ascii value.
+  int ThisChar = LastChar;
+  LastChar = getchar();
+  return ThisChar;
+}
+
+//===----------------------------------------------------------------------===//
+// Abstract Syntax Tree (aka Parse Tree)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// ExprAST - Base class for all expression nodes.
+class ExprAST {
+public:
+  virtual ~ExprAST() = default;
+
+  virtual Value *codegen() = 0;
+};
+
+/// NumberExprAST - Expression class for numeric literals like &quot;1.0&quot;.
+class NumberExprAST : public ExprAST {
+  double Val;
+
+public:
+  NumberExprAST(double Val) : Val(Val) {}
+
+  Value *codegen() override;
+};
+
+/// VariableExprAST - Expression class for referencing a variable, like &quot;a&quot;.
+class VariableExprAST : public ExprAST {
+  std::string Name;
+
+public:
+  VariableExprAST(const std::string &amp;Name) : Name(Name) {}
+
+  Value *codegen() override;
+};
+
+/// BinaryExprAST - Expression class for a binary operator.
+class BinaryExprAST : public ExprAST {
+  char Op;
+  std::unique_ptr&lt;ExprAST&gt; LHS, RHS;
+
+public:
+  BinaryExprAST(char Op, std::unique_ptr&lt;ExprAST&gt; LHS,
+                std::unique_ptr&lt;ExprAST&gt; RHS)
+      : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+
+  Value *codegen() override;
+};
+
+/// CallExprAST - Expression class for function calls.
+class CallExprAST : public ExprAST {
+  std::string Callee;
+  std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args;
+
+public:
+  CallExprAST(const std::string &amp;Callee,
+              std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args)
+      : Callee(Callee), Args(std::move(Args)) {}
+
+  Value *codegen() override;
+};
+
+/// IfExprAST - Expression class for if/then/else.
+class IfExprAST : public ExprAST {
+  std::unique_ptr&lt;ExprAST&gt; Cond, Then, Else;
+
+public:
+  IfExprAST(std::unique_ptr&lt;ExprAST&gt; Cond, std::unique_ptr&lt;ExprAST&gt; Then,
+            std::unique_ptr&lt;ExprAST&gt; Else)
+      : Cond(std::move(Cond)), Then(std::move(Then)), Else(std::move(Else)) {}
+
+  Value *codegen() override;
+};
+
+/// ForExprAST - Expression class for for/in.
+class ForExprAST : public ExprAST {
+  std::string VarName;
+  std::unique_ptr&lt;ExprAST&gt; Start, End, Step, Body;
+
+public:
+  ForExprAST(const std::string &amp;VarName, std::unique_ptr&lt;ExprAST&gt; Start,
+             std::unique_ptr&lt;ExprAST&gt; End, std::unique_ptr&lt;ExprAST&gt; Step,
+             std::unique_ptr&lt;ExprAST&gt; Body)
+      : VarName(VarName), Start(std::move(Start)), End(std::move(End)),
+        Step(std::move(Step)), Body(std::move(Body)) {}
+
+  Value *codegen() override;
+};
+
+/// PrototypeAST - This class represents the &quot;prototype&quot; for a function,
+/// which captures its name, and its argument names (thus implicitly the number
+/// of arguments the function takes).
+class PrototypeAST {
+  std::string Name;
+  std::vector&lt;std::string&gt; Args;
+
+public:
+  PrototypeAST(const std::string &amp;Name, std::vector&lt;std::string&gt; Args)
+      : Name(Name), Args(std::move(Args)) {}
+
+  Function *codegen();
+  const std::string &amp;getName() const { return Name; }
+};
+
+/// FunctionAST - This class represents a function definition itself.
+class FunctionAST {
+  std::unique_ptr&lt;PrototypeAST&gt; Proto;
+  std::unique_ptr&lt;ExprAST&gt; Body;
+
+public:
+  FunctionAST(std::unique_ptr&lt;PrototypeAST&gt; Proto,
+              std::unique_ptr&lt;ExprAST&gt; Body)
+      : Proto(std::move(Proto)), Body(std::move(Body)) {}
+
+  Function *codegen();
+};
+
+} // end anonymous namespace
+
+//===----------------------------------------------------------------------===//
+// Parser
+//===----------------------------------------------------------------------===//
+
+/// CurTok/getNextToken - Provide a simple token buffer.  CurTok is the current
+/// token the parser is looking at.  getNextToken reads another token from the
+/// lexer and updates CurTok with its results.
+static int CurTok;
+static int getNextToken() { return CurTok = gettok(); }
+
+/// BinopPrecedence - This holds the precedence for each binary operator that is
+/// defined.
+static std::map&lt;char, int&gt; BinopPrecedence;
+
+/// GetTokPrecedence - Get the precedence of the pending binary operator token.
+static int GetTokPrecedence() {
+  if (!isascii(CurTok))
+    return -1;
+
+  // Make sure it&#x27;s a declared binop.
+  int TokPrec = BinopPrecedence[CurTok];
+  if (TokPrec &lt;= 0)
+    return -1;
+  return TokPrec;
+}
+
+/// LogError* - These are little helper functions for error handling.
+std::unique_ptr&lt;ExprAST&gt; LogError(const char *Str) {
+  fprintf(stderr, &quot;Error: %s\n&quot;, Str);
+  return nullptr;
+}
+
+std::unique_ptr&lt;PrototypeAST&gt; LogErrorP(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+static std::unique_ptr&lt;ExprAST&gt; ParseExpression();
+
+/// numberexpr ::= number
+static std::unique_ptr&lt;ExprAST&gt; ParseNumberExpr() {
+  auto Result = std::make_unique&lt;NumberExprAST&gt;(NumVal);
+  getNextToken(); // consume the number
+  return std::move(Result);
+}
+
+/// parenexpr ::= &#x27;(&#x27; expression &#x27;)&#x27;
+static std::unique_ptr&lt;ExprAST&gt; ParseParenExpr() {
+  getNextToken(); // eat (.
+  auto V = ParseExpression();
+  if (!V)
+    return nullptr;
+
+  if (CurTok != &#x27;)&#x27;)
+    return LogError(&quot;expected &#x27;)&#x27;&quot;);
+  getNextToken(); // eat ).
+  return V;
+}
+
+/// identifierexpr
+///   ::= identifier
+///   ::= identifier &#x27;(&#x27; expression* &#x27;)&#x27;
+static std::unique_ptr&lt;ExprAST&gt; ParseIdentifierExpr() {
+  std::string IdName = IdentifierStr;
+
+  getNextToken(); // eat identifier.
+
+  if (CurTok != &#x27;(&#x27;) // Simple variable ref.
+    return std::make_unique&lt;VariableExprAST&gt;(IdName);
+
+  // Call.
+  getNextToken(); // eat (
+  std::vector&lt;std::unique_ptr&lt;ExprAST&gt;&gt; Args;
+  if (CurTok != &#x27;)&#x27;) {
+    while (true) {
+      if (auto Arg = ParseExpression())
+        Args.push_back(std::move(Arg));
+      else
+        return nullptr;
+
+      if (CurTok == &#x27;)&#x27;)
+        break;
+
+      if (CurTok != &#x27;,&#x27;)
+        return LogError(&quot;Expected &#x27;)&#x27; or &#x27;,&#x27; in argument list&quot;);
+      getNextToken();
+    }
+  }
+
+  // Eat the &#x27;)&#x27;.
+  getNextToken();
+
+  return std::make_unique&lt;CallExprAST&gt;(IdName, std::move(Args));
+}
+
+/// ifexpr ::= &#x27;if&#x27; expression &#x27;then&#x27; expression &#x27;else&#x27; expression
+static std::unique_ptr&lt;ExprAST&gt; ParseIfExpr() {
+  getNextToken(); // eat the if.
+
+  // condition.
+  auto Cond = ParseExpression();
+  if (!Cond)
+    return nullptr;
+
+  if (CurTok != tok_then)
+    return LogError(&quot;expected then&quot;);
+  getNextToken(); // eat the then
+
+  auto Then = ParseExpression();
+  if (!Then)
+    return nullptr;
+
+  if (CurTok != tok_else)
+    return LogError(&quot;expected else&quot;);
+
+  getNextToken();
+
+  auto Else = ParseExpression();
+  if (!Else)
+    return nullptr;
+
+  return std::make_unique&lt;IfExprAST&gt;(std::move(Cond), std::move(Then),
+                                      std::move(Else));
+}
+
+/// forexpr ::= &#x27;for&#x27; identifier &#x27;=&#x27; expr &#x27;,&#x27; expr (&#x27;,&#x27; expr)? &#x27;in&#x27; expression
+static std::unique_ptr&lt;ExprAST&gt; ParseForExpr() {
+  getNextToken(); // eat the for.
+
+  if (CurTok != tok_identifier)
+    return LogError(&quot;expected identifier after for&quot;);
+
+  std::string IdName = IdentifierStr;
+  getNextToken(); // eat identifier.
+
+  if (CurTok != &#x27;=&#x27;)
+    return LogError(&quot;expected &#x27;=&#x27; after for&quot;);
+  getNextToken(); // eat &#x27;=&#x27;.
+
+  auto Start = ParseExpression();
+  if (!Start)
+    return nullptr;
+  if (CurTok != &#x27;,&#x27;)
+    return LogError(&quot;expected &#x27;,&#x27; after for start value&quot;);
+  getNextToken();
+
+  auto End = ParseExpression();
+  if (!End)
+    return nullptr;
+
+  // The step value is optional.
+  std::unique_ptr&lt;ExprAST&gt; Step;
+  if (CurTok == &#x27;,&#x27;) {
+    getNextToken();
+    Step = ParseExpression();
+    if (!Step)
+      return nullptr;
+  }
+
+  if (CurTok != tok_in)
+    return LogError(&quot;expected &#x27;in&#x27; after for&quot;);
+  getNextToken(); // eat &#x27;in&#x27;.
+
+  auto Body = ParseExpression();
+  if (!Body)
+    return nullptr;
+
+  return std::make_unique&lt;ForExprAST&gt;(IdName, std::move(Start), std::move(End),
+                                       std::move(Step), std::move(Body));
+}
+
+/// primary
+///   ::= identifierexpr
+///   ::= numberexpr
+///   ::= parenexpr
+///   ::= ifexpr
+///   ::= forexpr
+static std::unique_ptr&lt;ExprAST&gt; ParsePrimary() {
+  switch (CurTok) {
+  default:
+    return LogError(&quot;unknown token when expecting an expression&quot;);
+  case tok_identifier:
+    return ParseIdentifierExpr();
+  case tok_number:
+    return ParseNumberExpr();
+  case &#x27;(&#x27;:
+    return ParseParenExpr();
+  case tok_if:
+    return ParseIfExpr();
+  case tok_for:
+    return ParseForExpr();
+  }
+}
+
+/// binoprhs
+///   ::= (&#x27;+&#x27; primary)*
+static std::unique_ptr&lt;ExprAST&gt; ParseBinOpRHS(int ExprPrec,
+                                              std::unique_ptr&lt;ExprAST&gt; LHS) {
+  // If this is a binop, find its precedence.
+  while (true) {
+    int TokPrec = GetTokPrecedence();
+
+    // If this is a binop that binds at least as tightly as the current binop,
+    // consume it, otherwise we are done.
+    if (TokPrec &lt; ExprPrec)
+      return LHS;
+
+    // Okay, we know this is a binop.
+    int BinOp = CurTok;
+    getNextToken(); // eat binop
+
+    // Parse the primary expression after the binary operator.
+    auto RHS = ParsePrimary();
+    if (!RHS)
+      return nullptr;
+
+    // If BinOp binds less tightly with RHS than the operator after RHS, let
+    // the pending operator take RHS as its LHS.
+    int NextPrec = GetTokPrecedence();
+    if (TokPrec &lt; NextPrec) {
+      RHS = ParseBinOpRHS(TokPrec + 1, std::move(RHS));
+      if (!RHS)
+        return nullptr;
+    }
+
+    // Merge LHS/RHS.
+    LHS =
+        std::make_unique&lt;BinaryExprAST&gt;(BinOp, std::move(LHS), std::move(RHS));
+  }
+}
+
+/// expression
+///   ::= primary binoprhs
+///
+static std::unique_ptr&lt;ExprAST&gt; ParseExpression() {
+  auto LHS = ParsePrimary();
+  if (!LHS)
+    return nullptr;
+
+  return ParseBinOpRHS(0, std::move(LHS));
+}
+
+/// prototype
+///   ::= id &#x27;(&#x27; id* &#x27;)&#x27;
+static std::unique_ptr&lt;PrototypeAST&gt; ParsePrototype() {
+  if (CurTok != tok_identifier)
+    return LogErrorP(&quot;Expected function name in prototype&quot;);
+
+  std::string FnName = IdentifierStr;
+  getNextToken();
+
+  if (CurTok != &#x27;(&#x27;)
+    return LogErrorP(&quot;Expected &#x27;(&#x27; in prototype&quot;);
+
+  std::vector&lt;std::string&gt; ArgNames;
+  while (getNextToken() == tok_identifier)
+    ArgNames.push_back(IdentifierStr);
+  if (CurTok != &#x27;)&#x27;)
+    return LogErrorP(&quot;Expected &#x27;)&#x27; in prototype&quot;);
+
+  // success.
+  getNextToken(); // eat &#x27;)&#x27;.
+
+  return std::make_unique&lt;PrototypeAST&gt;(FnName, std::move(ArgNames));
+}
+
+/// definition ::= &#x27;def&#x27; prototype expression
+static std::unique_ptr&lt;FunctionAST&gt; ParseDefinition() {
+  getNextToken(); // eat def.
+  auto Proto = ParsePrototype();
+  if (!Proto)
+    return nullptr;
+
+  if (auto E = ParseExpression())
+    return std::make_unique&lt;FunctionAST&gt;(std::move(Proto), std::move(E));
+  return nullptr;
+}
+
+/// toplevelexpr ::= expression
+static std::unique_ptr&lt;FunctionAST&gt; ParseTopLevelExpr() {
+  if (auto E = ParseExpression()) {
+    // Make an anonymous proto.
+    auto Proto = std::make_unique&lt;PrototypeAST&gt;(&quot;__anon_expr&quot;,
+                                                 std::vector&lt;std::string&gt;());
+    return std::make_unique&lt;FunctionAST&gt;(std::move(Proto), std::move(E));
+  }
+  return nullptr;
+}
+
+/// external ::= &#x27;extern&#x27; prototype
+static std::unique_ptr&lt;PrototypeAST&gt; ParseExtern() {
+  getNextToken(); // eat extern.
+  return ParsePrototype();
+}
+
+//===----------------------------------------------------------------------===//
+// Code Generation
+//===----------------------------------------------------------------------===//
+
+static std::unique_ptr&lt;LLVMContext&gt; TheContext;
+static std::unique_ptr&lt;Module&gt; TheModule;
+static std::unique_ptr&lt;IRBuilder&lt;&gt;&gt; Builder;
+static std::map&lt;std::string, Value *&gt; NamedValues;
+static std::unique_ptr&lt;KaleidoscopeJIT&gt; TheJIT;
+static std::unique_ptr&lt;FunctionPassManager&gt; TheFPM;
+static std::unique_ptr&lt;LoopAnalysisManager&gt; TheLAM;
+static std::unique_ptr&lt;FunctionAnalysisManager&gt; TheFAM;
+static std::unique_ptr&lt;CGSCCAnalysisManager&gt; TheCGAM;
+static std::unique_ptr&lt;ModuleAnalysisManager&gt; TheMAM;
+static std::unique_ptr&lt;PassInstrumentationCallbacks&gt; ThePIC;
+static std::unique_ptr&lt;StandardInstrumentations&gt; TheSI;
+static std::map&lt;std::string, std::unique_ptr&lt;PrototypeAST&gt;&gt; FunctionProtos;
+static ExitOnError ExitOnErr;
+
+Value *LogErrorV(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+Function *getFunction(std::string Name) {
+  // First, see if the function has already been added to the current module.
+  if (auto *F = TheModule-&gt;getFunction(Name))
+    return F;
+
+  // If not, check whether we can codegen the declaration from some existing
+  // prototype.
+  auto FI = FunctionProtos.find(Name);
+  if (FI != FunctionProtos.end())
+    return FI-&gt;second-&gt;codegen();
+
+  // If no existing prototype exists, return null.
+  return nullptr;
+}
+
+Value *NumberExprAST::codegen() {
+  return ConstantFP::get(*TheContext, APFloat(Val));
+}
+
+Value *VariableExprAST::codegen() {
+  // Look this variable up in the function.
+  Value *V = NamedValues[Name];
+  if (!V)
+    return LogErrorV(&quot;Unknown variable name&quot;);
+  return V;
+}
+
+Value *BinaryExprAST::codegen() {
+  Value *L = LHS-&gt;codegen();
+  Value *R = RHS-&gt;codegen();
+  if (!L || !R)
+    return nullptr;
+
+  switch (Op) {
+  case &#x27;+&#x27;:
+    return Builder-&gt;CreateFAdd(L, R, &quot;addtmp&quot;);
+  case &#x27;-&#x27;:
+    return Builder-&gt;CreateFSub(L, R, &quot;subtmp&quot;);
+  case &#x27;*&#x27;:
+    return Builder-&gt;CreateFMul(L, R, &quot;multmp&quot;);
+  case &#x27;&lt;&#x27;:
+    L = Builder-&gt;CreateFCmpULT(L, R, &quot;cmptmp&quot;);
+    // Convert bool 0/1 to double 0.0 or 1.0
+    return Builder-&gt;CreateUIToFP(L, Type::getDoubleTy(*TheContext), &quot;booltmp&quot;);
+  default:
+    return LogErrorV(&quot;invalid binary operator&quot;);
+  }
+}
+
+Value *CallExprAST::codegen() {
+  // Look up the name in the global module table.
+  Function *CalleeF = getFunction(Callee);
+  if (!CalleeF)
+    return LogErrorV(&quot;Unknown function referenced&quot;);
+
+  // If argument mismatch error.
+  if (CalleeF-&gt;arg_size() != Args.size())
+    return LogErrorV(&quot;Incorrect # arguments passed&quot;);
+
+  std::vector&lt;Value *&gt; ArgsV;
+  for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+    ArgsV.push_back(Args[i]-&gt;codegen());
+    if (!ArgsV.back())
+      return nullptr;
+  }
+
+  return Builder-&gt;CreateCall(CalleeF, ArgsV, &quot;calltmp&quot;);
+}
+
+Value *IfExprAST::codegen() {
+  Value *CondV = Cond-&gt;codegen();
+  if (!CondV)
+    return nullptr;
+
+  // Convert condition to a bool by comparing non-equal to 0.0.
+  CondV = Builder-&gt;CreateFCmpONE(
+      CondV, ConstantFP::get(*TheContext, APFloat(0.0)), &quot;ifcond&quot;);
+
+  Function *TheFunction = Builder-&gt;GetInsertBlock()-&gt;getParent();
+
+  // Create blocks for the then and else cases.  Insert the &#x27;then&#x27; block at the
+  // end of the function.
+  BasicBlock *ThenBB = BasicBlock::Create(*TheContext, &quot;then&quot;, TheFunction);
+  BasicBlock *ElseBB = BasicBlock::Create(*TheContext, &quot;else&quot;);
+  BasicBlock *MergeBB = BasicBlock::Create(*TheContext, &quot;ifcont&quot;);
+
+  Builder-&gt;CreateCondBr(CondV, ThenBB, ElseBB);
+
+  // Emit then value.
+  Builder-&gt;SetInsertPoint(ThenBB);
+
+  Value *ThenV = Then-&gt;codegen();
+  if (!ThenV)
+    return nullptr;
+
+  Builder-&gt;CreateBr(MergeBB);
+  // Codegen of &#x27;Then&#x27; can change the current block, update ThenBB for the PHI.
+  ThenBB = Builder-&gt;GetInsertBlock();
+
+  // Emit else block.
+  TheFunction-&gt;insert(TheFunction-&gt;end(), ElseBB);
+  Builder-&gt;SetInsertPoint(ElseBB);
+
+  Value *ElseV = Else-&gt;codegen();
+  if (!ElseV)
+    return nullptr;
+
+  Builder-&gt;CreateBr(MergeBB);
+  // Codegen of &#x27;Else&#x27; can change the current block, update ElseBB for the PHI.
+  ElseBB = Builder-&gt;GetInsertBlock();
+
+  // Emit merge block.
+  TheFunction-&gt;insert(TheFunction-&gt;end(), MergeBB);
+  Builder-&gt;SetInsertPoint(MergeBB);
+  PHINode *PN = Builder-&gt;CreatePHI(Type::getDoubleTy(*TheContext), 2, &quot;iftmp&quot;);
+
+  PN-&gt;addIncoming(ThenV, ThenBB);
+  PN-&gt;addIncoming(ElseV, ElseBB);
+  return PN;
+}
+
+// Output for-loop as:
+//   ...
+//   start = startexpr
+//   goto loop
+// loop:
+//   variable = phi [start, loopheader], [nextvariable, loopend]
+//   ...
+//   bodyexpr
+//   ...
+// loopend:
+//   step = stepexpr
+//   nextvariable = variable + step
+//   endcond = endexpr
+//   br endcond, loop, endloop
+// outloop:
+Value *ForExprAST::codegen() {
+  // Emit the start code first, without &#x27;variable&#x27; in scope.
+  Value *StartVal = Start-&gt;codegen();
+  if (!StartVal)
+    return nullptr;
+
+  // Make the new basic block for the loop header, inserting after current
+  // block.
+  Function *TheFunction = Builder-&gt;GetInsertBlock()-&gt;getParent();
+  BasicBlock *PreheaderBB = Builder-&gt;GetInsertBlock();
+  BasicBlock *LoopBB = BasicBlock::Create(*TheContext, &quot;loop&quot;, TheFunction);
+
+  // Insert an explicit fall through from the current block to the LoopBB.
+  Builder-&gt;CreateBr(LoopBB);
+
+  // Start insertion in LoopBB.
+  Builder-&gt;SetInsertPoint(LoopBB);
+
+  // Start the PHI node with an entry for Start.
+  PHINode *Variable =
+      Builder-&gt;CreatePHI(Type::getDoubleTy(*TheContext), 2, VarName);
+  Variable-&gt;addIncoming(StartVal, PreheaderBB);
+
+  // Within the loop, the variable is defined equal to the PHI node.  If it
+  // shadows an existing variable, we have to restore it, so save it now.
+  Value *OldVal = NamedValues[VarName];
+  NamedValues[VarName] = Variable;
+
+  // Emit the body of the loop.  This, like any other expr, can change the
+  // current BB.  Note that we ignore the value computed by the body, but don&#x27;t
+  // allow an error.
+  if (!Body-&gt;codegen())
+    return nullptr;
+
+  // Emit the step value.
+  Value *StepVal = nullptr;
+  if (Step) {
+    StepVal = Step-&gt;codegen();
+    if (!StepVal)
+      return nullptr;
+  } else {
+    // If not specified, use 1.0.
+    StepVal = ConstantFP::get(*TheContext, APFloat(1.0));
+  }
+
+  Value *NextVar = Builder-&gt;CreateFAdd(Variable, StepVal, &quot;nextvar&quot;);
+
+  // Compute the end condition.
+  Value *EndCond = End-&gt;codegen();
+  if (!EndCond)
+    return nullptr;
+
+  // Convert condition to a bool by comparing non-equal to 0.0.
+  EndCond = Builder-&gt;CreateFCmpONE(
+      EndCond, ConstantFP::get(*TheContext, APFloat(0.0)), &quot;loopcond&quot;);
+
+  // Create the &quot;after loop&quot; block and insert it.
+  BasicBlock *LoopEndBB = Builder-&gt;GetInsertBlock();
+  BasicBlock *AfterBB =
+      BasicBlock::Create(*TheContext, &quot;afterloop&quot;, TheFunction);
+
+  // Insert the conditional branch into the end of LoopEndBB.
+  Builder-&gt;CreateCondBr(EndCond, LoopBB, AfterBB);
+
+  // Any new code will be inserted in AfterBB.
+  Builder-&gt;SetInsertPoint(AfterBB);
+
+  // Add a new entry to the PHI node for the backedge.
+  Variable-&gt;addIncoming(NextVar, LoopEndBB);
+
+  // Restore the unshadowed variable.
+  if (OldVal)
+    NamedValues[VarName] = OldVal;
+  else
+    NamedValues.erase(VarName);
+
+  // for expr always returns 0.0.
+  return Constant::getNullValue(Type::getDoubleTy(*TheContext));
+}
+
+Function *PrototypeAST::codegen() {
+  // Make the function type:  double(double,double) etc.
+  std::vector&lt;Type *&gt; Doubles(Args.size(), Type::getDoubleTy(*TheContext));
+  FunctionType *FT =
+      FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false);
+
+  Function *F =
+      Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
+
+  // Set names for all arguments.
+  unsigned Idx = 0;
+  for (auto &amp;Arg : F-&gt;args())
+    Arg.setName(Args[Idx++]);
+
+  return F;
+}
+
+Function *FunctionAST::codegen() {
+  // Transfer ownership of the prototype to the FunctionProtos map, but keep a
+  // reference to it for use below.
+  auto &amp;P = *Proto;
+  FunctionProtos[Proto-&gt;getName()] = std::move(Proto);
+  Function *TheFunction = getFunction(P.getName());
+  if (!TheFunction)
+    return nullptr;
+
+  // Create a new basic block to start insertion into.
+  BasicBlock *BB = BasicBlock::Create(*TheContext, &quot;entry&quot;, TheFunction);
+  Builder-&gt;SetInsertPoint(BB);
+
+  // Record the function arguments in the NamedValues map.
+  NamedValues.clear();
+  for (auto &amp;Arg : TheFunction-&gt;args())
+    NamedValues[std::string(Arg.getName())] = &amp;Arg;
+
+  if (Value *RetVal = Body-&gt;codegen()) {
+    // Finish off the function.
+    Builder-&gt;CreateRet(RetVal);
+
+    // Validate the generated code, checking for consistency.
+    verifyFunction(*TheFunction);
+
+    // Run the optimizer on the function.
+    TheFPM-&gt;run(*TheFunction, *TheFAM);
+
+    return TheFunction;
+  }
+
+  // Error reading body, remove function.
+  TheFunction-&gt;eraseFromParent();
+  return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// Top-Level parsing and JIT Driver
+//===----------------------------------------------------------------------===//
+
+static void InitializeModuleAndManagers() {
+  // Open a new context and module.
+  TheContext = std::make_unique&lt;LLVMContext&gt;();
+  TheModule = std::make_unique&lt;Module&gt;(&quot;KaleidoscopeJIT&quot;, *TheContext);
+  TheModule-&gt;setTargetTriple(TheJIT-&gt;getTargetTriple());
+  TheModule-&gt;setDataLayout(TheJIT-&gt;getDataLayout());
+
+  // Create a new builder for the module.
+  Builder = std::make_unique&lt;IRBuilder&lt;&gt;&gt;(*TheModule);
+
+  // Create new pass and analysis managers.
+  TheFPM = std::make_unique&lt;FunctionPassManager&gt;();
+  TheLAM = std::make_unique&lt;LoopAnalysisManager&gt;();
+  TheFAM = std::make_unique&lt;FunctionAnalysisManager&gt;();
+  TheCGAM = std::make_unique&lt;CGSCCAnalysisManager&gt;();
+  TheMAM = std::make_unique&lt;ModuleAnalysisManager&gt;();
+  ThePIC = std::make_unique&lt;PassInstrumentationCallbacks&gt;();
+  TheSI = std::make_unique&lt;StandardInstrumentations&gt;(*TheContext,
+                                                     /*DebugLogging*/ true);
+  TheSI-&gt;registerCallbacks(*ThePIC, TheMAM.get());
+
+  // Add transform passes.
+  // Do simple &quot;peephole&quot; optimizations and bit-twiddling optzns.
+  TheFPM-&gt;addPass(InstCombinePass());
+  // Reassociate expressions.
+  TheFPM-&gt;addPass(ReassociatePass());
+  // Eliminate Common SubExpressions.
+  TheFPM-&gt;addPass(GVNPass());
+  // Simplify the control flow graph (deleting unreachable blocks, etc).
+  TheFPM-&gt;addPass(SimplifyCFGPass());
+
+  // Register analysis passes used in these transform passes.
+  PassBuilder PB(*TheContext);
+  PB.registerModuleAnalyses(*TheMAM);
+  PB.registerFunctionAnalyses(*TheFAM);
+  PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
+}
+
+static void HandleDefinition() {
+  if (auto FnAST = ParseDefinition()) {
+    if (auto *FnIR = FnAST-&gt;codegen()) {
+      fprintf(stderr, &quot;Read function definition:&quot;);
+      FnIR-&gt;print(errs());
+      fprintf(stderr, &quot;\n&quot;);
+      ExitOnErr(TheJIT-&gt;addModule(
+          ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
+      InitializeModuleAndManagers();
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+static void HandleExtern() {
+  if (auto ProtoAST = ParseExtern()) {
+    if (auto *FnIR = ProtoAST-&gt;codegen()) {
+      fprintf(stderr, &quot;Read extern: &quot;);
+      FnIR-&gt;print(errs());
+      fprintf(stderr, &quot;\n&quot;);
+      FunctionProtos[ProtoAST-&gt;getName()] = std::move(ProtoAST);
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+static void HandleTopLevelExpression() {
+  // Evaluate a top-level expression into an anonymous function.
+  if (auto FnAST = ParseTopLevelExpr()) {
+    if (FnAST-&gt;codegen()) {
+      // Create a ResourceTracker to track JIT&#x27;d memory allocated to our
+      // anonymous expression -- that way we can free it after executing.
+      auto RT = TheJIT-&gt;getMainJITDylib().createResourceTracker();
+
+      auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+      ExitOnErr(TheJIT-&gt;addModule(std::move(TSM), RT));
+      InitializeModuleAndManagers();
+
+      // Search the JIT for the __anon_expr symbol.
+      auto ExprSymbol = ExitOnErr(TheJIT-&gt;lookup(&quot;__anon_expr&quot;));
+
+      // Get the symbol&#x27;s address and cast it to the right type (takes no
+      // arguments, returns a double) so we can call it as a native function.
+      double (*FP)() = ExprSymbol.toPtr&lt;double (*)()&gt;();
+      fprintf(stderr, &quot;Evaluated to %f\n&quot;, FP());
+
+      // Delete the anonymous expression module from the JIT.
+      ExitOnErr(RT-&gt;remove());
+    }
+  } else {
+    // Skip token for error recovery.
+    getNextToken();
+  }
+}
+
+/// top ::= definition | external | expression | &#x27;;&#x27;
+static void MainLoop() {
+  while (true) {
+    fprintf(stderr, &quot;ready&gt; &quot;);
+    switch (CurTok) {
+    case tok_eof:
+      return;
+    case &#x27;;&#x27;: // ignore top-level semicolons.
+      getNextToken();
+      break;
+    case tok_def:
+      HandleDefinition();
+      break;
+    case tok_extern:
+      HandleExtern();
+      break;
+    default:
+      HandleTopLevelExpression();
+      break;
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// &quot;Library&quot; functions that can be &quot;extern&#x27;d&quot; from user code.
+//===----------------------------------------------------------------------===//
+
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+/// putchard - putchar that takes a double and returns 0.
+extern &quot;C&quot; DLLEXPORT double putchard(double X) {
+  fputc((char)X, stderr);
+  return 0;
+}
+
+/// printd - printf that takes a double prints it as &quot;%f\n&quot;, returning 0.
+extern &quot;C&quot; DLLEXPORT double printd(double X) {
+  fprintf(stderr, &quot;%f\n&quot;, X);
+  return 0;
+}
+
+//===----------------------------------------------------------------------===//
+// Main driver code.
+//===----------------------------------------------------------------------===//
+
+int main() {
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+
+  // Install standard binary operators.
+  // 1 is lowest precedence.
+  BinopPrecedence[&#x27;&lt;&#x27;] = 10;
+  BinopPrecedence[&#x27;+&#x27;] = 20;
+  BinopPrecedence[&#x27;-&#x27;] = 20;
+  BinopPrecedence[&#x27;*&#x27;] = 40; // highest.
+
+  // Prime the first token.
+  fprintf(stderr, &quot;ready&gt; &quot;);
+  getNextToken();
+
+  TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
+
+  InitializeModuleAndManagers();
+
+  // Run the main &quot;interpreter loop&quot; now.
+  MainLoop();
+
+  return 0;
+}
+</code></pre>
+<p>下一章：扩展语言——用户自定义运算符</p><h2 id="references">原文参考链接</h2><ul><li><a href="https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/index.html">Implementing a language with LLVM</a></li><li><a href="https://llvm.org/cmds/opt.html">opt</a></li><li><a href="https://llvm.org/docs/ProgrammersManual.html#viewing-graphs-while-debugging-code">a window will pop up</a></li><li><a href="http://en.wikipedia.org/wiki/Static_single_assignment_form">the wikipedia article</a></li><li><a href="Kaleidoscope_Chapter7.html">Chapter 7</a></li><li><a href="https://llvm.org/docs/LangRef.html#functionstructure">requires all basic blocks to be “terminated”</a></li><li><a href="https://llvm.org/docs/LangRef.html#terminators">control flow instruction</a></li><li><a href="Kaleidoscope_Chapter6.html">Next: Extending the language: user-defined operators</a></li></ul><footer>原文与示例代码版权归 LLVM Project 及其贡献者；许可及最新内容见 <a href="https://llvm.org/docs/">LLVM 官方文档</a>。中文翻译中标注的“译注”用于补充版本和语义说明。</footer></body></html>

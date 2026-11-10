@@ -4,12 +4,12 @@
 #include <memory>
 #include <string>
 #include <vector>
-#include "header.h"
+namespace llvm { class Value; class Function; }
 
 class ExprAST {
 public:
     virtual ~ExprAST() = default;
-    virtual Value *codegen() = 0;
+    virtual llvm::Value *codegen() = 0;
 };
 
 class NumberExprAST : public ExprAST {
@@ -18,7 +18,7 @@ class NumberExprAST : public ExprAST {
 public:
     NumberExprAST(double val);
     double getValue() const { return m_val; }
-    Value *codegen() override;
+    llvm::Value *codegen() override;
 };
 
 // 一个变量其实是一个名字
@@ -28,7 +28,7 @@ class VariableExprAST : public ExprAST {
 public:
     VariableExprAST(const std::string &name);
     const std::string &getName() const { return m_name; }
-    Value *codegen() override;
+    llvm::Value *codegen() override;
 };
 
 class BinaryExprAST : public ExprAST {
@@ -41,7 +41,7 @@ public:
     char getOp() const { return m_op; }
     const ExprAST &getLHS() const { return *m_LHS; }
     const ExprAST &getRHS() const { return *m_RHS; }
-    Value *codegen() override;
+    llvm::Value *codegen() override;
 };
 
 // 函数调用：保存函数名和实参表达式。
@@ -54,7 +54,7 @@ public:
                 std::vector<std::unique_ptr<ExprAST>> args);
     const std::string &getCallee() const { return m_callee; }
     const std::vector<std::unique_ptr<ExprAST>> &getArgs() const { return m_args; }
-    Value *codegen() override;
+    llvm::Value *codegen() override;
 };
 
 // 函数原型：保存函数名和形参名。
@@ -66,7 +66,7 @@ public:
     PrototypeAST(const std::string &name, std::vector<std::string> args);
     const std::string &getName() const;
     const std::vector<std::string> &getArgs() const { return m_args; }
-    Function* codegen();
+    llvm::Function *codegen();
 
 };
 
@@ -80,7 +80,7 @@ public:
                 std::unique_ptr<ExprAST> body);
     const PrototypeAST &getPrototype() const { return *m_proto; }
     const ExprAST &getBody() const { return *m_body; }
-    Function *codegen();
+    llvm::Function *codegen();
 };
 
 #endif
