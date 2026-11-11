@@ -70,6 +70,7 @@ gdb: debug
 test: $(TARGET) $(TEST_TARGET)
 	./$(TEST_TARGET) < tests/parser_cases.k
 	python3 tests/cli_test.py ./$(TARGET)
+	python3 tests/repl_test.py ./$(TARGET)
 	python3 tests/codegen_test.py ./$(TARGET) "$(shell $(LLVM_CONFIG) --bindir)"
 
 clean:

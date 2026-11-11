@@ -1,8 +1,8 @@
 # Kaleidoscope：解析、AST 与 LLVM IR 生成
 
 当前实现支持读取 Kaleidoscope 源码并构建 AST，覆盖数字、变量、括号、
-二元运算、函数调用、函数定义和 `extern` 声明。增加 `--emit-ir` 可生成
-经过 LLVM 验证的完整 IR 模块。程序本身尚未集成 JIT，不会直接执行表达式。
+二元运算、函数调用、函数定义和 `extern` 声明。默认像教程一样逐条输出
+LLVM IR；`--emit-ir` 则导出经过验证的完整 IR 模块。程序本身尚未集成 JIT，不会直接执行表达式。
 
 需要支持 C++17 的 `g++`、`make` 和 LLVM 开发包；测试还需要 Python 3、
 同版本的 `llvm-as` 与 `clang`。本次在 LLVM 18.1.3 上验证。
@@ -23,25 +23,37 @@ make LLVM_CONFIG=llvm-config-18
 make demo
 ```
 
-编译生成 `build/kaleidoscope`，读取 `examples/demo.k`，输出：
-
-```text
-Parsed a function definition: add
-Parsed an extern: sin
-Parsed a top-level expression
-Parsed a top-level expression
-```
+编译生成 `build/kaleidoscope`，读取 `examples/demo.k`，逐条输出函数定义、
+外部声明及顶层表达式对应的 IR。
 
 手动输入代码：
 
 ```bash
 make run
+# 也可以直接执行 ./build/kaleidoscope
 ```
 
-交互终端会显示 `ready>`。可以输入 `1 + 2;` 或 `def add(x y) x + y;`。
+默认进入教程式交互，每输入一条完整代码就立即显示 IR，例如：
+
+```text
+ready> def test(x) 1+2+x;
+Read function definition:
+define double @test(double %x) {
+entry:
+  %addtmp = fadd double 3.000000e+00, %x
+  ret double %addtmp
+}
+
+ready>
+```
+
+默认模式也可显式指定为 `--repl`。IR 和诊断按教程输出到标准错误，
+`ready>` 只在交互终端出现。函数定义和外部声明保留在当前会话中，后续代码
+可以调用它们；顶层表达式生成临时 `__anon_expr`，打印后清理。
+
 在 Linux/macOS 终端中，在空行按 `Ctrl+D` 结束输入；`Ctrl+C` 直接退出。
-词法分析器需要看到下一个 token 才能确认当前表达式结束，交互时建议使用
-分号结束语句。
+词法分析器需要看到下一个 token 才能确认当前表达式结束，交互时请使用
+分号结束代码并回车，这样会立即输出 IR，无需等待 EOF。换行本身不是语句分隔符。
 
 也可以通过管道或文件输入，非交互模式不显示提示符：
 
@@ -50,9 +62,11 @@ printf 'def add(x y) x + y; add(12, 3.5);\n' | ./build/kaleidoscope
 ./build/kaleidoscope < examples/demo.k
 ```
 
-保留原有的 token 打印模式：
+保留仅解析、AST 和 token 调试模式：
 
 ```bash
+./build/kaleidoscope --parse < examples/demo.k     # 原来的 Parsed ... 提示
+./build/kaleidoscope --dump-ast < examples/demo.k
 ./build/kaleidoscope --tokens < examples/demo.k
 ```
 
@@ -73,8 +87,9 @@ add(12, sin(3.5));
 
 语法错误输出到标准错误。程序跳到分号或下一条 `def` / `extern` 声明
 继续解析；只要遇到过语法错误，最终退出码就是 `1`，全部成功则为 `0`。
-默认解析和 AST 模式只检查语法。`--emit-ir` 还检查变量、被调用函数、
-参数数量、重复参数和冲突定义；任意错误均返回 `1`，且不输出部分 IR。
+`--parse` 和 AST 模式只检查语法。默认交互和 `--emit-ir` 模式还检查变量、
+被调用函数、参数数量、重复参数和冲突定义。交互模式出错后继续接受输入，
+已成功的 IR 保留在输出中；`--emit-ir` 任意错误均返回 `1`，且不输出部分模块。
 
 ## 生成 LLVM IR
 
@@ -86,7 +101,7 @@ llvm-as build/demo.ll -o build/demo.bc # 工具版本应与构建时一致
 ```
 
 重定向 IR 时请直接调用程序，或使用 `make -s ir`，避免 make 的命令回显混入文件。
-IR 模式在 EOF 时输出完整模块；交互终端用 Ctrl+D 结束输入。
+`--emit-ir` 模式在 EOF 时输出完整模块；交互终端用 Ctrl+D 结束输入。
 连续顶层表达式保存为 `__anon_expr.0`、`__anon_expr.1` 等独立函数。
 函数必须先声明或定义才能被调用，函数体内可以递归调用自身。
 
@@ -121,7 +136,8 @@ clang build/average.ll build/check.c -o build/check
 
 代码生成模式先调用 `InitializeModule()`，随后对解析成功的节点调用
 `codegen()`。定义失败时撤销其函数体；此前存在的声明及调用引用予以保留。
-全部输入成功后，由 `EmitModule()` 验证并输出模块。当前实现为单进程、
+默认交互模式逐条打印函数 IR；`--emit-ir` 在全部输入成功后，由
+`EmitModule()` 验证并输出模块。当前实现为单进程、
 单输入流的学习编译器，不提供并发或多会话接口。
 
 ## 验证和调试
@@ -136,7 +152,8 @@ make clean
 测试覆盖优先级、括号、左结合、嵌套调用、函数结构、错误恢复、EOF、token
 和 AST 模式。代码生成测试进一步用 `llvm-as` 验证 IR，用 `clang` 与 C 驱动
 链接并执行，检查比较与算术结果、重复声明、声明/定义参数改名、连续顶层
-表达式、语义错误与失败定义的恢复。
+表达式、语义错误与失败定义的恢复。伪终端测试检查未发送 EOF 时即时输出
+IR、连续输入、跨输入函数引用、出错恢复与交互提示。
 
 中文教程正文按官方第 4–10 章翻译，源码、命令和输出保留原文。
 后续章节包含 JIT、控制流、可变变量、目标文件和调试信息等学习内容；

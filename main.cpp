@@ -3,6 +3,7 @@
 #include "token.h"
 #include "Codegen.h"
 #include "llvm/IR/Function.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <cstdio>
 #include <iostream>
@@ -45,7 +46,18 @@ void RecoverFromError() {
         getNextToken();
 }
 
-int MainLoop(bool PrintAST, bool GenerateIR) {
+enum class Mode { Repl, Parse, AST, EmitIR };
+
+void PrintIR(const llvm::Function &Function, const char *Message) {
+    llvm::errs() << Message << "\n";
+    Function.print(llvm::errs());
+    llvm::errs() << "\n";
+    llvm::errs().flush();
+}
+
+int MainLoop(Mode mode) {
+    const bool PrintAST = mode == Mode::AST;
+    const bool GenerateIR = mode == Mode::Repl || mode == Mode::EmitIR;
     const bool Interactive = isatty(fileno(stdin));
     bool HadError = false;
     if (Interactive)
@@ -66,7 +78,14 @@ int MainLoop(bool PrintAST, bool GenerateIR) {
                 if (PrintAST)
                     DumpAST(*Function, std::cout);
                 Parsed = true;
-                if (GenerateIR && !Function->codegen()) HadError = true;
+                if (GenerateIR) {
+                    if (auto *IR = Function->codegen()) {
+                        if (mode == Mode::Repl)
+                            PrintIR(*IR, "Read function definition:");
+                    } else {
+                        HadError = true;
+                    }
+                }
             }
             break;
         case tok_extern:
@@ -75,7 +94,14 @@ int MainLoop(bool PrintAST, bool GenerateIR) {
                 if (PrintAST)
                     DumpAST(*Proto, std::cout);
                 Parsed = true;
-                if (GenerateIR && !Proto->codegen()) HadError = true;
+                if (GenerateIR) {
+                    if (auto *IR = Proto->codegen()) {
+                        if (mode == Mode::Repl)
+                            PrintIR(*IR, "Read extern:");
+                    } else {
+                        HadError = true;
+                    }
+                }
             }
             break;
         default:
@@ -85,9 +111,17 @@ int MainLoop(bool PrintAST, bool GenerateIR) {
                     DumpAST(*Function, std::cout);
                 Parsed = true;
                 if (GenerateIR) {
-                    if (auto *IR = Function->codegen())
-                        IR->setName("__anon_expr." + std::to_string(AnonymousId++));
-                    else HadError = true;
+                    if (auto *IR = Function->codegen()) {
+                        if (mode == Mode::Repl) {
+                            PrintIR(*IR, "Read top-level expression:");
+                            // Temporary expressions must not collide with the next one.
+                            IR->eraseFromParent();
+                        } else {
+                            IR->setName("__anon_expr." + std::to_string(AnonymousId++));
+                        }
+                    } else {
+                        HadError = true;
+                    }
                 }
             }
             break;
@@ -102,7 +136,7 @@ int MainLoop(bool PrintAST, bool GenerateIR) {
         if (CurTok == ';')
             getNextToken();
     }
-    if (GenerateIR && !HadError && !EmitModule()) HadError = true;
+    if (mode == Mode::EmitIR && !HadError && !EmitModule()) HadError = true;
     return HadError ? 1 : 0;
 }
 
@@ -111,12 +145,20 @@ int MainLoop(bool PrintAST, bool GenerateIR) {
 int main(int argc, char **argv) {
     if (argc == 2 && std::string(argv[1]) == "--tokens")
         return PrintTokens();
-    const bool PrintAST = argc == 2 && std::string(argv[1]) == "--dump-ast";
-    const bool GenerateIR = argc == 2 && std::string(argv[1]) == "--emit-ir";
-    if (argc != 1 && !PrintAST && !GenerateIR) {
-        std::fprintf(stderr, "Usage: %s [--tokens | --dump-ast | --emit-ir]\n", argv[0]);
+    Mode mode = Mode::Repl;
+    if (argc == 2) {
+        const std::string option = argv[1];
+        if (option == "--parse") mode = Mode::Parse;
+        else if (option == "--dump-ast") mode = Mode::AST;
+        else if (option == "--emit-ir") mode = Mode::EmitIR;
+        else if (option != "--repl") {
+            std::fprintf(stderr, "Usage: %s [--repl | --parse | --tokens | --dump-ast | --emit-ir]\n", argv[0]);
+            return 1;
+        }
+    } else if (argc != 1) {
+        std::fprintf(stderr, "Usage: %s [--repl | --parse | --tokens | --dump-ast | --emit-ir]\n", argv[0]);
         return 1;
     }
-    if (GenerateIR) InitializeModule();
-    return MainLoop(PrintAST, GenerateIR);
+    if (mode == Mode::Repl || mode == Mode::EmitIR) InitializeModule();
+    return MainLoop(mode);
 }

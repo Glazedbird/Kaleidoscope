@@ -10,7 +10,7 @@ BINARY = sys.argv.pop(1)
 
 def run(source, *args):
     return subprocess.run(
-        [BINARY, *args], input=source, text=True, capture_output=True, timeout=3
+        [BINARY, *(args or ("--parse",))], input=source, text=True, capture_output=True, timeout=3
     )
 
 
