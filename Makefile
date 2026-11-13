@@ -2,7 +2,7 @@ CXX = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -Wpedantic -O0 -g3 -fno-omit-frame-pointer
 LLVM_CONFIG ?= llvm-config
 LLVM_INCLUDEDIR := $(shell $(LLVM_CONFIG) --includedir 2>/dev/null)
-LLVM_LDFLAGS := $(shell $(LLVM_CONFIG) --ldflags --libs core --system-libs 2>/dev/null)
+LLVM_LDFLAGS := $(shell $(LLVM_CONFIG) --ldflags --libs core passes --system-libs 2>/dev/null)
 CPPFLAGS += -I. -isystem $(LLVM_INCLUDEDIR)
 LDLIBS += $(LLVM_LDFLAGS)
 # DEBUG=1 定义预处理宏；DEBUG=0 不定义，适用于 #ifdef DEBUG。
@@ -14,7 +14,7 @@ DEBUG_CONFIG = build/.debug-config
 GDB ?= gdb
 INPUT ?= examples/demo.k
 TARGET = build/kaleidoscope
-SOURCES = main.cpp token.cpp ExprAST.cpp Parser.cpp ASTPrinter.cpp Codegen.cpp
+SOURCES = main.cpp
 OBJECTS = $(SOURCES:%.cpp=build/%.o)
 DEPS = $(OBJECTS:.o=.d)
 TEST_TARGET = build/parser_test

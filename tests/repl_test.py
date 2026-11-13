@@ -43,7 +43,7 @@ class ReplTests(unittest.TestCase):
             self.assertEqual(read_until(b'ready> '), 'ready> ')
             result = submit('def test(x) 1+2+x;')
             self.assertIn('Read function definition:\ndefine double @test(double %x)', result)
-            self.assertIn('%addtmp = fadd double 3.000000e+00, %x', result)
+            self.assertRegex(result, r'%addtmp = fadd double (?:3\.000000e\+00, %x|%x, 3\.000000e\+00)')
             self.assertIn('ret double %addtmp', result)
             self.assertIn('Read extern:\ndeclare double @sin(double)',
                           submit('extern sin(x);'))
@@ -70,6 +70,18 @@ class ReplTests(unittest.TestCase):
             process.stdout.close()
             process.stderr.close()
             os.close(master)
+
+    def test_repeated_temporary_functions_after_optimization(self):
+        source = 'def square(x) (x+1)*(x+1);' + ''.join(
+            f'square({i});' for i in range(128))
+        result = subprocess.run([BINARY], input=source, text=True,
+                                capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertEqual(result.stderr.count('Read function definition:'), 1)
+        self.assertEqual(result.stderr.count('Read top-level expression:'), 128)
+        self.assertEqual(result.stderr.count('call double @square('), 128)
+        self.assertNotIn('Error:', result.stderr)
 
     def test_pipe_uses_tutorial_output_without_prompts(self):
         for options in ([], ['--repl']):

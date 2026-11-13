@@ -40,12 +40,15 @@ ready> def test(x) 1+2+x;
 Read function definition:
 define double @test(double %x) {
 entry:
-  %addtmp = fadd double 3.000000e+00, %x
+  %addtmp = fadd double %x, 3.000000e+00
   ret double %addtmp
 }
 
 ready>
 ```
+
+函数体生成并验证后，会运行 InstCombine、Reassociate、GVN 和 SimplifyCFG
+优化，再次验证后输出。因此 IR 中操作数的顺序或临时变量可能与未优化示例不同。
 
 默认模式也可显式指定为 `--repl`。IR 和诊断按教程输出到标准错误，
 `ready>` 只在交互终端出现。函数定义和外部声明保留在当前会话中，后续代码

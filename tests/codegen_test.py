@@ -26,6 +26,7 @@ class CodegenTests(unittest.TestCase):
     def test_module_and_execution(self):
         ir = self.verify('extern add(a b); def add(x y) x+y; '
                          'def less(x y) x<y; def calc(x) add(x*2, 3)-1; '
+                         'def square(x) (1+2+x)*(x+(1+2)); '
                          'calc(4); 1+2;')
         self.assertIn('@__anon_expr.0', ir)
         self.assertIn('@__anon_expr.1', ir)
@@ -36,13 +37,21 @@ class CodegenTests(unittest.TestCase):
             (path / 'module.ll').write_text(ir)
             (path / 'driver.c').write_text('''extern double calc(double);
 extern double less(double, double);
-int main(void) { return !(calc(4) == 10 && less(1, 2) == 1 && less(2, 1) == 0); }
+extern double square(double);
+int main(void) { return !(calc(4) == 10 && less(1, 2) == 1 && less(2, 1) == 0 && square(4) == 49); }
 ''')
             linked = subprocess.run([str(LLVM_BIN / 'clang'), str(path / 'module.ll'),
                                      str(path / 'driver.c'), '-o', str(path / 'run')],
                                     text=True, capture_output=True, timeout=15)
             self.assertEqual(linked.returncode, 0, linked.stderr)
             self.assertEqual(subprocess.run([str(path / 'run')], timeout=5).returncode, 0)
+
+    def test_optimizer_eliminates_common_subexpressions(self):
+        ir = self.verify('def square(x) (1+2+x)*(x+(1+2));')
+        # IRBuilder alone folds 1+2 but leaves two additions. The optimization
+        # pipeline must recognize their equality and reuse a single result.
+        self.assertEqual(ir.count('fadd double'), 1, ir)
+        self.assertEqual(ir.count('fmul double'), 1, ir)
 
     def test_declarations_recursion_and_empty_module(self):
         for source in ['', 'extern f(x); extern f(y); def f(z) z; extern f(a);',
